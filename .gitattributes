@@ -1,0 +1,4 @@
+# Store every text file with LF line endings, even when edited on Windows.
+# Shell scripts and Docker files break with Windows (CRLF) line endings.
+* text=auto eol=lf
+*.bat text eol=crlf
