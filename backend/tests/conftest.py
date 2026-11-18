@@ -1,16 +1,96 @@
-from collections.abc import AsyncIterator
+"""Tests run against their own database (<name>_test) and Redis database 15, so they never
+touch development data. Both are wiped between tests."""
+
+import asyncio
+import os
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
+from sqlalchemy import make_url, text
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from opspilot.config import Settings, get_settings
 from opspilot.main import create_app
+
+ADMIN_TOKEN = "test-admin-token"
+
+
+def _test_settings(**overrides: Any) -> Settings:
+    base = get_settings()
+    db_url = make_url(base.database_url)
+    test_db = db_url.set(database=f"{db_url.database}_test")
+    redis_url = base.redis_url.rsplit("/", 1)[0] + "/15"
+    values: dict[str, Any] = {
+        "environment": "test",
+        "database_url": test_db.render_as_string(hide_password=False),
+        "redis_url": redis_url,
+        "admin_token": ADMIN_TOKEN,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+async def _create_database(settings: Settings) -> None:
+    url = make_url(settings.database_url)
+    admin = create_async_engine(url.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    async with admin.connect() as conn:
+        exists = await conn.scalar(
+            text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": url.database}
+        )
+        if not exists:
+            await conn.execute(text(f'CREATE DATABASE "{url.database}"'))
+    await admin.dispose()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _database() -> None:
+    settings = _test_settings()
+    asyncio.run(_create_database(settings))
+    config = Config("alembic.ini")
+    # env.py reads the URL from settings, so point it at the test database for this run
+    get_settings.cache_clear()
+    previous = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = settings.database_url
+    try:
+        command.upgrade(config, "head")
+    finally:
+        if previous is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous
+        get_settings.cache_clear()
 
 
 @pytest.fixture
-async def app() -> AsyncIterator[FastAPI]:
-    # A fresh app per test, with startup and shutdown run exactly as in production
-    application = create_app()
+def settings() -> Settings:
+    return _test_settings()
+
+
+@pytest.fixture
+def make_app() -> Callable[..., FastAPI]:
+    return lambda **overrides: create_app(_test_settings(**overrides))
+
+
+async def _clean(settings: Settings) -> None:
+    engine = create_async_engine(settings.database_url)
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE workspaces, api_keys CASCADE"))
+    await engine.dispose()
+    redis = Redis.from_url(settings.redis_url)
+    await redis.flushdb()
+    await redis.aclose()
+
+
+@pytest.fixture
+async def app(settings: Settings) -> AsyncIterator[FastAPI]:
+    await _clean(settings)
+    application = create_app(settings)
     async with application.router.lifespan_context(application):
         yield application
 
@@ -20,3 +100,22 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         yield http
+
+
+@pytest.fixture
+def create_workspace(client: AsyncClient) -> Callable[..., Any]:
+    """Creates a workspace and returns (workspace, admin key)."""
+
+    async def create(name: str = "Acme") -> tuple[dict[str, Any], str]:
+        res = await client.post(
+            "/v1/workspaces", json={"name": name}, headers={"X-Admin-Token": ADMIN_TOKEN}
+        )
+        assert res.status_code == 201, res.text
+        body = res.json()
+        return body["workspace"], body["api_key"]["key"]
+
+    return create
+
+
+def auth(key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {key}"}

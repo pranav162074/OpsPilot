@@ -4,7 +4,7 @@ from typing import Literal
 from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
-from opspilot.config import get_settings
+from opspilot.api.deps import SettingsDep
 from opspilot.health import CheckResult, check_postgres, check_redis, run_checks
 
 router = APIRouter(prefix="/health", tags=["health"])
@@ -27,7 +27,7 @@ async def live() -> LiveResponse:
 
 
 @router.get("/ready", responses={503: {"model": ReadyResponse}})
-async def ready(request: Request, response: Response) -> ReadyResponse:
+async def ready(request: Request, response: Response, settings: SettingsDep) -> ReadyResponse:
     """Every dependency answers. A load balancer sends traffic only while this returns 200."""
     state = request.app.state
     checks = await run_checks(
@@ -35,7 +35,7 @@ async def ready(request: Request, response: Response) -> ReadyResponse:
             "postgres": partial(check_postgres, state.engine),
             "redis": partial(check_redis, state.redis),
         },
-        limit_seconds=get_settings().health_check_timeout_seconds,
+        limit_seconds=settings.health_check_timeout_seconds,
     )
     all_up = all(check.status == "up" for check in checks.values())
     if not all_up:

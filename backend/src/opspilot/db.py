@@ -1,4 +1,9 @@
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from opspilot.config import Settings
 
@@ -11,3 +16,8 @@ def create_engine(settings: Settings) -> AsyncEngine:
         max_overflow=10,
         pool_pre_ping=True,
     )
+
+
+def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    # expire_on_commit=False keeps loaded objects usable after commit, which async code needs
+    return async_sessionmaker(engine, expire_on_commit=False)
