@@ -5,13 +5,14 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from opspilot import __version__
-from opspilot.api import api_keys, health, workspaces
+from opspilot.api import api_keys, documents, health, workspaces
 from opspilot.api.errors import register_error_handlers
 from opspilot.config import Settings, get_settings
 from opspilot.db import create_engine, create_sessionmaker
 from opspilot.logging import configure_logging
 from opspilot.middleware import RequestIdMiddleware
 from opspilot.ratelimit import RateLimiter
+from opspilot.worker import enqueue_ingestion
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -27,6 +28,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.sessionmaker = create_sessionmaker(app.state.engine)
         app.state.redis = Redis.from_url(settings.redis_url, socket_connect_timeout=2)
         app.state.rate_limiter = RateLimiter(app.state.redis)
+        # Swappable, so tests can capture what would be queued
+        app.state.enqueue_ingestion = enqueue_ingestion
         try:
             yield
         finally:
@@ -39,6 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(workspaces.router)
     app.include_router(api_keys.router)
+    app.include_router(documents.router)
     return app
 
 

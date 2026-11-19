@@ -26,6 +26,21 @@ class Settings(BaseSettings):
     api_rate_limit_per_minute: int = 120
     workspace_create_limit_per_hour: int = 10
 
+    # Celery's queue. A separate Redis database from the app's cache and rate limits.
+    celery_broker_url: str = "redis://localhost:6380/1"
+
+    # Documents
+    max_document_bytes: int = 1_000_000
+    chunk_max_tokens: int = 400
+    chunk_overlap_tokens: int = 50
+
+    # Ingestion: give up after this many attempts; treat a document "processing" for longer
+    # than stale_seconds as abandoned by a crashed worker; re-send documents still "pending"
+    # after requeue_after_seconds (their task was lost, for example Redis restarted)
+    ingestion_max_attempts: int = 3
+    ingestion_stale_seconds: int = 600
+    ingestion_requeue_after_seconds: int = 120
+
     @field_validator("admin_token", mode="before")
     @classmethod
     def _blank_token_means_unset(cls, value: object) -> object:
