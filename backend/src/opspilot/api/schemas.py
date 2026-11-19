@@ -4,7 +4,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from opspilot.models import Role
+from opspilot.models import DocumentStatus, Role, SourceType
 
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
@@ -55,3 +55,36 @@ class WorkspaceCreated(BaseModel):
 class Me(BaseModel):
     workspace: WorkspaceOut
     api_key: ApiKeyOut
+
+
+class DocumentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    title: str
+    filename: str
+    source_type: SourceType
+    media_type: str
+    size_bytes: int
+    status: DocumentStatus
+    error: str | None
+    chunk_count: int
+    created_at: datetime
+    updated_at: datetime
+    processed_at: datetime | None
+
+
+class DocumentPage(BaseModel):
+    items: list[DocumentOut]
+    # Pass as ?cursor= to get the next page. null on the last page.
+    next_cursor: str | None
+
+
+class ChunkOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    ordinal: int
+    heading: str
+    content: str
+    token_count: int
+    char_start: int
+    char_end: int

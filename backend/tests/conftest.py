@@ -3,19 +3,21 @@ touch development data. Both are wiped between tests."""
 
 import asyncio
 import os
-from collections.abc import AsyncIterator, Callable
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 from redis.asyncio import Redis
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from opspilot.config import Settings, get_settings
+from opspilot.ingestion.service import Outcome, ingest_document
 from opspilot.main import create_app
 
 ADMIN_TOKEN = "test-admin-token"
@@ -80,7 +82,7 @@ def make_app() -> Callable[..., FastAPI]:
 async def _clean(settings: Settings) -> None:
     engine = create_async_engine(settings.database_url)
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE workspaces, api_keys CASCADE"))
+        await conn.execute(text("TRUNCATE workspaces, api_keys, documents, chunks CASCADE"))
     await engine.dispose()
     redis = Redis.from_url(settings.redis_url)
     await redis.flushdb()
@@ -93,6 +95,25 @@ async def app(settings: Settings) -> AsyncIterator[FastAPI]:
     application = create_app(settings)
     async with application.router.lifespan_context(application):
         yield application
+
+
+@pytest.fixture
+def enqueued(app: FastAPI) -> list[uuid.UUID]:
+    """Document IDs the API queued for ingestion. Nothing reaches a real Celery broker."""
+    queued: list[uuid.UUID] = []
+    app.state.enqueue_ingestion = queued.append
+    return queued
+
+
+@pytest.fixture
+def ingest(app: FastAPI, settings: Settings) -> Callable[..., Awaitable[Outcome]]:
+    """Runs ingestion the way the worker would, in the test's event loop."""
+
+    async def run(document_id: str | uuid.UUID, **overrides: Any) -> Outcome:
+        effective = settings.model_copy(update=overrides) if overrides else settings
+        return await ingest_document(app.state.sessionmaker, effective, uuid.UUID(str(document_id)))
+
+    return run
 
 
 @pytest.fixture
@@ -119,3 +140,16 @@ def create_workspace(client: AsyncClient) -> Callable[..., Any]:
 
 def auth(key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"}
+
+
+async def upload(
+    client: AsyncClient,
+    key: str,
+    content: str | bytes = "# Runbook\n\nRestart the service.\n",
+    filename: str = "runbook.md",
+    **form: str,
+) -> Response:
+    data = content.encode() if isinstance(content, str) else content
+    return await client.post(
+        "/v1/documents", files={"file": (filename, data)}, data=form, headers=auth(key)
+    )

@@ -15,11 +15,13 @@ class ApiError(Exception):
         code: str,
         message: str,
         headers: dict[str, str] | None = None,
+        details: object = None,
     ) -> None:
         self.status_code = status_code
         self.code = code
         self.message = message
         self.headers = headers
+        self.details = details
 
 
 def _body(code: str, message: str, details: object = None) -> dict[str, object]:
@@ -32,7 +34,7 @@ def _body(code: str, message: str, details: object = None) -> dict[str, object]:
 async def _api_error(_: Request, exc: Exception) -> JSONResponse:
     exc = cast(ApiError, exc)  # Starlette only routes ApiError here
     return JSONResponse(
-        _body(exc.code, exc.message), status_code=exc.status_code, headers=exc.headers
+        _body(exc.code, exc.message, exc.details), status_code=exc.status_code, headers=exc.headers
     )
 
 
