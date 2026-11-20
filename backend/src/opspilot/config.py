@@ -41,6 +41,18 @@ class Settings(BaseSettings):
     ingestion_stale_seconds: int = 600
     ingestion_requeue_after_seconds: int = 120
 
+    # Embeddings. "hashing" needs no API key (word overlap only: tests, CI, offline work);
+    # "gemini" uses Google's embedding model and needs GEMINI_API_KEY.
+    embedding_provider: Literal["hashing", "gemini"] = "hashing"
+    embedding_model: str = "gemini-embedding-001"
+    gemini_api_key: SecretStr | None = None
+    query_embedding_cache_seconds: int = 24 * 60 * 60
+
+    # Search: how many candidates each retriever contributes before fusion, and the RRF
+    # constant (60 is the value from the original paper; higher flattens rank differences)
+    search_candidates: int = 50
+    rrf_k: int = 60
+
     @field_validator("admin_token", mode="before")
     @classmethod
     def _blank_token_means_unset(cls, value: object) -> object:

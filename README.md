@@ -88,6 +88,57 @@ Other details:
 - The list is newest first with cursor pagination (`?limit=20&cursor=...`), and filters by `status` and `source_type`.
 - Worker logs carry the request ID of the upload that queued the task.
 
+## Search
+
+`POST /v1/search` (viewer) finds the passages in a workspace's documents that best answer a question:
+
+```bash
+curl -X POST localhost:8000/v1/search -H "Authorization: Bearer ops_..." \
+  -H "Content-Type: application/json" \
+  -d '{"query": "database ran out of connections", "limit": 5, "mode": "hybrid"}'
+```
+
+Each result has the chunk's text, its heading path, the document it came from, its exact position in that document (`char_start`, `char_end`) for citations, and the rank each retriever gave it.
+
+**How it works**
+
+- **Embeddings:** at ingestion, every chunk (heading path plus text) is embedded and stored in a pgvector column with an HNSW index. Each chunk records the model that embedded it, and search only compares vectors from the current model.
+- **Vector search** finds passages with similar meaning: "pods killed for using too much memory" finds the section on `OOMKilled` without sharing its words. Queries and documents are embedded with different task types, and query embeddings are cached in Redis.
+- **Keyword search** uses Postgres full-text search: a generated `tsvector` column with a GIN index, English stemming, and `websearch_to_tsquery`, so quotes, `OR` and `-word` work. It catches exact identifiers that embeddings blur, like `ERR_POOL_TIMEOUT` or `db-primary.internal`.
+- **Hybrid** (the default) runs both and merges them with **Reciprocal Rank Fusion**: each result scores `1/(60 + rank)` per list it appears in. RRF uses ranks only, so the two retrievers' scores never need calibrating against each other.
+- **Multi-tenant vector search:** an HNSW index searches the whole table and filters by workspace afterwards, which can leave a small workspace with too few results. pgvector 0.8's iterative scan keeps searching until enough rows pass the filter.
+- **Degrades instead of failing:** if the embedding API is down, hybrid search answers from keywords alone with `"degraded": true`. Vector-only search returns `503`.
+
+**Embedding providers** (`EMBEDDING_PROVIDER`):
+
+- `hashing` (default): local, no API key. It captures word overlap, not meaning, and is meant for tests, CI and offline work.
+- `gemini`: Google's `gemini-embedding-001` at 768 dimensions, normalized. Needs `GEMINI_API_KEY`.
+
+After switching provider or model, re-index so every chunk is embedded by the new model:
+
+```bash
+uv run python -m opspilot.cli reindex        # only documents embedded by another model
+uv run python -m opspilot.cli reindex --all  # everything
+```
+
+**Retrieval evaluation**
+
+`backend/evals` holds six runbooks and a postmortem, plus 22 questions, each with the document that answers it. Half quote an exact identifier; half are paraphrases. The evaluation scores each mode by hit@1, hit@3 and MRR:
+
+```bash
+uv run python -m opspilot.evals.retrieval
+```
+
+With the offline `hashing` embedder:
+
+| mode | hit@1 | MRR | paraphrased questions, hit@1 |
+|---|---|---|---|
+| keyword | 0.50 | 0.50 | 0.08 |
+| vector | 0.73 | 0.83 | 0.58 |
+| hybrid | 0.77 | 0.86 | 0.58 |
+
+Keyword search nails exact identifiers and misses almost every paraphrase. Hybrid keeps keyword search's perfect score on identifiers and adds vector search's recall on paraphrases. A test runs this evaluation on every CI build, so a change that makes retrieval worse fails the build.
+
 ## Checks
 
 From `backend/`, the same checks CI runs on every pull request:

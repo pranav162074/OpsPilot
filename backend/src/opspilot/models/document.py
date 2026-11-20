@@ -2,8 +2,10 @@ import enum
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     CheckConstraint,
+    Computed,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -14,9 +16,10 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
+from opspilot.embeddings.base import DIMENSIONS
 from opspilot.models.base import Base, CreatedAtMixin, IdMixin
 
 
@@ -91,6 +94,17 @@ class Chunk(IdMixin, Base):
             ondelete="CASCADE",
         ),
         UniqueConstraint("document_id", "ordinal"),
+        # Approximate nearest-neighbour search on embeddings, by cosine distance. HNSW answers
+        # in milliseconds at millions of rows, at the cost of being approximate.
+        Index(
+            "ix_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        # Full-text (keyword) search
+        Index("ix_chunks_search_vector", "search_vector", postgresql_using="gin"),
     )
 
     document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
@@ -104,3 +118,13 @@ class Chunk(IdMixin, Base):
     # Where the chunk sits in the document, so answers can point at the exact passage
     char_start: Mapped[int] = mapped_column(Integer, nullable=False)
     char_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Embedding of heading + content. Null until embedded (chunks from before embeddings existed)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(DIMENSIONS))
+    embedding_model: Mapped[str | None] = mapped_column(String(100))
+    # Kept up to date by Postgres itself from heading and content. English stemming, so
+    # "restarting" matches "restart".
+    search_vector: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', heading || ' ' || content)", persisted=True),
+        nullable=False,
+    )

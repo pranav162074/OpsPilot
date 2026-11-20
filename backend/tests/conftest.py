@@ -17,6 +17,7 @@ from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from opspilot.config import Settings, get_settings
+from opspilot.embeddings import HashingEmbedder
 from opspilot.ingestion.service import Outcome, ingest_document
 from opspilot.main import create_app
 
@@ -111,7 +112,9 @@ def ingest(app: FastAPI, settings: Settings) -> Callable[..., Awaitable[Outcome]
 
     async def run(document_id: str | uuid.UUID, **overrides: Any) -> Outcome:
         effective = settings.model_copy(update=overrides) if overrides else settings
-        return await ingest_document(app.state.sessionmaker, effective, uuid.UUID(str(document_id)))
+        return await ingest_document(
+            app.state.sessionmaker, effective, uuid.UUID(str(document_id)), HashingEmbedder()
+        )
 
     return run
 

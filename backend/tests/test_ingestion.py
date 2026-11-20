@@ -11,6 +11,7 @@ from sqlalchemy import func, select, update
 
 from opspilot import worker
 from opspilot.config import Settings
+from opspilot.embeddings import HashingEmbedder
 from opspilot.ingestion import service
 from opspilot.ingestion.service import Outcome, find_stuck_documents
 from opspilot.models import Chunk, Document
@@ -93,7 +94,13 @@ async def test_a_slow_worker_cannot_overwrite_a_newer_attempt(
     await set_document(app, document_id, status="processing", attempts=2)
 
     outcome = await service._process(
-        app.state.sessionmaker, settings, document_id, 1, document.workspace_id, document.media_type
+        app.state.sessionmaker,
+        settings,
+        HashingEmbedder(),
+        document_id,
+        1,
+        document.workspace_id,
+        document.media_type,
     )
 
     assert outcome == Outcome.SUPERSEDED
@@ -110,7 +117,13 @@ async def test_a_document_deleted_mid_way_is_dropped(
         await session.commit()
 
     outcome = await service._process(
-        app.state.sessionmaker, settings, document_id, 1, document.workspace_id, document.media_type
+        app.state.sessionmaker,
+        settings,
+        HashingEmbedder(),
+        document_id,
+        1,
+        document.workspace_id,
+        document.media_type,
     )
 
     assert outcome == Outcome.SKIPPED

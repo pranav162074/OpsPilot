@@ -17,8 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from opspilot.config import Settings, get_settings
+from opspilot.embeddings import EmbeddingUnavailable, build_embedder
 from opspilot.ingestion.service import (
     TRANSIENT_ERRORS,
+    Outcome,
     find_stuck_documents,
     ingest_document,
 )
@@ -76,15 +78,24 @@ def ingest_document_task(self: Task[Any, Any], document_id: str, request_id: str
     # Log lines from the worker carry the ID of the upload request that caused them
     token = request_id_var.set(request_id)
     try:
-        outcome = _run(
-            lambda sessionmaker, settings: ingest_document(
-                sessionmaker, settings, uuid.UUID(document_id)
-            )
-        )
-        return outcome.value
+
+        async def job(
+            sessionmaker: async_sessionmaker[AsyncSession], settings: Settings
+        ) -> Outcome:
+            embedder = build_embedder(settings)
+            try:
+                return await ingest_document(
+                    sessionmaker, settings, uuid.UUID(document_id), embedder
+                )
+            finally:
+                await embedder.aclose()
+
+        return _run(job).value
     except TRANSIENT_ERRORS as exc:
-        # Back off 5s, 10s, 20s, 40s, 60s
+        # Back off 5s, 10s, 20s, 40s, 60s, or as long as a rate-limited API asks
         countdown = min(60, 5 * 2**self.request.retries)
+        if isinstance(exc, EmbeddingUnavailable) and exc.retry_after:
+            countdown = max(countdown, min(300, int(exc.retry_after)))
         logger.warning("Ingestion of %s failed, retrying in %ss", document_id, countdown)
         raise self.retry(exc=exc, countdown=countdown) from exc
     finally:
