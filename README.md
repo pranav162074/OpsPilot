@@ -137,7 +137,45 @@ With the offline `hashing` embedder:
 | vector | 0.73 | 0.83 | 0.58 |
 | hybrid | 0.77 | 0.86 | 0.58 |
 
+With `gemini-embedding-001` (768 dimensions):
+
+| mode | hit@1 | MRR | paraphrased questions, hit@1 |
+|---|---|---|---|
+| keyword | 0.50 | 0.50 | 0.08 |
+| vector | 0.95 | 0.98 | 1.00 |
+| hybrid | 1.00 | 1.00 | 1.00 |
+
 Keyword search nails exact identifiers and misses almost every paraphrase. Hybrid keeps keyword search's perfect score on identifiers and adds vector search's recall on paraphrases. A test runs this evaluation on every CI build, so a change that makes retrieval worse fails the build.
+
+## Investigations (the agent)
+
+`POST /v1/investigations` (responder) asks the agent a question about an incident. It searches the workspace's documents, answers with citations, and has the answer checked against its sources before returning it.
+
+```bash
+curl -X POST localhost:8000/v1/investigations -H "Authorization: Bearer ops_..." \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Payments are failing with ERR_POOL_TIMEOUT. What should I do?"}'
+```
+
+The response holds the answer, its citations (document, heading, chunk), token usage, latency, and the full trace of every model call and tool call. `GET /v1/investigations` and `GET /v1/investigations/{id}` (viewer) read them back.
+
+**How it works:** a LangGraph state machine.
+
+```
+agent --tool calls--> tools --> agent          ReAct: reason, act, observe, repeat
+  | step limit --> force_answer --> review
+  +-- answer --> review --supported--> done
+                   +--unsupported--> agent     one revision, with the reviewer's notes
+```
+
+- **Tools:** `search_knowledge_base` (the hybrid search) and `read_section` (a passage with its neighbours). They're built per request and bound to the caller's workspace, so the model can't reach another workspace's documents whatever it asks for.
+- **Citations are checked, not trusted:** the answer must cite passages as `[c:<chunk id>]`. Any citation to a passage the tools never returned (a made-up id) is removed and counted in `invalid_citations`.
+- **Self-review:** a second model call compares the draft with the passages it cites. If it finds unsupported statements, the agent gets one chance to revise.
+- **Bounded:** at most `AGENT_MAX_STEPS` tool rounds (then it must answer with what it has), an overall timeout, and a per-workspace hourly limit, since model calls cost money.
+- **Prompt injection:** documents are written by people, so the system prompt tells the model to treat tool results as reference material and ignore instructions inside them.
+- **Observable:** every run stores its model calls, tool calls, tokens and latency per step, and logs a summary line.
+
+**Tests** run the real graph with a scripted chat model that plays back prepared replies (tool calls, drafts, reviewer verdicts). They cover the ReAct loop, revision, the step limit, unknown tools, made-up citations, workspace isolation, timeouts and failures, with no API calls. Tests always use the offline embedder and no real model, whatever `.env` says.
 
 ## Checks
 

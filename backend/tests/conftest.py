@@ -34,6 +34,10 @@ def _test_settings(**overrides: Any) -> Settings:
         "database_url": test_db.render_as_string(hide_password=False),
         "redis_url": redis_url,
         "admin_token": ADMIN_TOKEN,
+        # Tests never call paid APIs, whatever your .env says: offline embeddings, and no
+        # language model unless a test installs a scripted one
+        "embedding_provider": "hashing",
+        "gemini_api_key": None,
     }
     values.update(overrides)
     return Settings(**values)
@@ -83,7 +87,9 @@ def make_app() -> Callable[..., FastAPI]:
 async def _clean(settings: Settings) -> None:
     engine = create_async_engine(settings.database_url)
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE workspaces, api_keys, documents, chunks CASCADE"))
+        await conn.execute(
+            text("TRUNCATE workspaces, api_keys, documents, chunks, investigations CASCADE")
+        )
     await engine.dispose()
     redis = Redis.from_url(settings.redis_url)
     await redis.flushdb()

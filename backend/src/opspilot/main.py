@@ -5,7 +5,8 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from opspilot import __version__
-from opspilot.api import api_keys, documents, health, search, workspaces
+from opspilot.agent.llm import build_chat_model
+from opspilot.api import api_keys, documents, health, investigations, search, workspaces
 from opspilot.api.errors import register_error_handlers
 from opspilot.config import Settings, get_settings
 from opspilot.db import create_engine, create_sessionmaker
@@ -33,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Swappable, so tests can capture what would be queued
         app.state.enqueue_ingestion = enqueue_ingestion
         app.state.embedder = build_embedder(settings)
+        app.state.llm = build_chat_model(settings)
         app.state.query_cache = QueryEmbeddingCache(
             app.state.redis, settings.query_embedding_cache_seconds
         )
@@ -51,6 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(api_keys.router)
     app.include_router(documents.router)
     app.include_router(search.router)
+    app.include_router(investigations.router)
     return app
 
 

@@ -21,6 +21,10 @@ class JsonFormatter(logging.Formatter):
         request_id = request_id_var.get()
         if request_id:
             entry["request_id"] = request_id
+        # Structured values passed as logger.info("...", extra={"fields": {...}})
+        fields = getattr(record, "fields", None)
+        if isinstance(fields, dict):
+            entry.update(fields)
         if record.exc_info:
             entry["exception"] = self.formatException(record.exc_info)
         return json.dumps(entry)
