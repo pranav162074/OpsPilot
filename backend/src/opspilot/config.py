@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     search_candidates: int = 50
     rrf_k: int = 60
 
+    # The investigation agent's language model. Unset GEMINI_API_KEY (or llm_provider "none")
+    # switches investigations off; everything else still works.
+    llm_provider: Literal["none", "gemini"] = "gemini"
+    llm_model: str = "gemini-3.8-flash"
+    # Tool-use rounds before the agent must answer with what it has
+    agent_max_steps: int = 6
+    # The reviewer can send a draft back for one revision
+    agent_reflection: bool = True
+    agent_timeout_seconds: float = 90.0
+    investigations_per_hour: int = 30
+
     @field_validator("admin_token", mode="before")
     @classmethod
     def _blank_token_means_unset(cls, value: object) -> object:
