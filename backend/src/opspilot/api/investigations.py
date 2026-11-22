@@ -1,13 +1,13 @@
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
-from opspilot.agent.service import run_investigation
+from opspilot.agent.runner import RunOutcome, execute_investigation
 from opspilot.api.deps import RateLimiterDep, Responder, SessionDep, SettingsDep, Viewer, enforce
 from opspilot.api.errors import ApiError
 from opspilot.models import Investigation, InvestigationStatus, SourceType
@@ -21,6 +21,8 @@ class InvestigationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: Annotated[str, Field(min_length=3, max_length=2000)]
     source_types: list[SourceType] | None = None
+    # Return at once and let the worker run it, instead of waiting for the answer
+    background: bool = False
 
 
 class CitationOut(BaseModel):
@@ -98,7 +100,10 @@ async def create_investigation(
     limiter: RateLimiterDep,
 ) -> InvestigationDetail:
     """Asks the agent a question. It searches the workspace's documents, answers with
-    citations, and has the answer reviewed against its sources before returning it."""
+    citations, and has the answer reviewed against its sources before returning it.
+
+    With "background": true it returns 202 at once and the worker runs it; poll
+    GET /v1/investigations/{id} until the status isn't "running"."""
     llm = request.app.state.llm
     if llm is None:
         raise ApiError(
@@ -116,6 +121,7 @@ async def create_investigation(
         workspace_id=principal.workspace.id,
         created_by_key_id=principal.api_key.id,
         question=body.question,
+        source_types=[s.value for s in body.source_types] if body.source_types else None,
         status=InvestigationStatus.RUNNING.value,
         model=settings.llm_model,
         citations=[],
@@ -124,53 +130,25 @@ async def create_investigation(
     session.add(row)
     await session.commit()
 
-    try:
-        result = await run_investigation(
-            llm=llm,
-            sessionmaker=request.app.state.sessionmaker,
-            settings=settings,
-            embedder=request.app.state.embedder,
-            query_cache=request.app.state.query_cache,
-            workspace_id=principal.workspace.id,
-            question=body.question,
-            source_types=body.source_types,
-        )
-    except TimeoutError:
-        await _fail(session, row, "The investigation took too long and was stopped")
-        raise ApiError(504, "agent_timeout", "The investigation took too long") from None
-    except Exception as exc:
-        logger.exception("Investigation %s failed", row.id)
-        await _fail(session, row, f"The agent failed: {type(exc).__name__}")
-        raise ApiError(502, "agent_failed", "The language model call failed") from exc
+    if body.background:
+        request.app.state.enqueue_investigation(row.id)
+        response.status_code = status.HTTP_202_ACCEPTED
+        return _detail(row)
 
-    row.status = InvestigationStatus.COMPLETED.value
-    row.answer = result.answer
-    row.citations = [
-        {
-            "chunk_id": str(c.chunk_id),
-            "document_id": str(c.document_id),
-            "document_title": c.document_title,
-            "heading": c.heading,
-        }
-        for c in result.citations
-    ]
-    row.trace = result.events
-    row.invalid_citations = result.invalid_citations
-    row.llm_calls = result.trace.llm_calls
-    row.tool_calls = result.trace.tool_calls
-    row.input_tokens = result.trace.input_tokens
-    row.output_tokens = result.trace.output_tokens
-    row.latency_ms = result.latency_ms
-    row.completed_at = datetime.now(UTC)
-    await session.commit()
+    outcome = await execute_investigation(
+        investigation_id=row.id,
+        llm=llm,
+        sessionmaker=request.app.state.sessionmaker,
+        settings=settings,
+        embedder=request.app.state.embedder,
+        query_cache=request.app.state.query_cache,
+    )
+    if outcome == RunOutcome.TIMED_OUT:
+        raise ApiError(504, "agent_timeout", "The investigation took too long")
+    if outcome == RunOutcome.FAILED:
+        raise ApiError(502, "agent_failed", "The language model call failed")
+    await session.refresh(row)
     return _detail(row)
-
-
-async def _fail(session: SessionDep, row: Investigation, error: str) -> None:
-    row.status = InvestigationStatus.FAILED.value
-    row.error = error
-    row.completed_at = datetime.now(UTC)
-    await session.commit()
 
 
 @router.get("")

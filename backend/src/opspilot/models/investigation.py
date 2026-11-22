@@ -32,6 +32,7 @@ class Investigation(IdMixin, CreatedAtMixin, Base):
         UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="SET NULL")
     )
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    source_types: Mapped[list[str] | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     answer: Mapped[str | None] = mapped_column(Text)
     citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
@@ -45,4 +46,7 @@ class Investigation(IdMixin, CreatedAtMixin, Base):
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     invalid_citations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     latency_ms: Mapped[float | None] = mapped_column(Float)
+    # Set when a runner claims it: a second delivery of the same task finds it taken and
+    # skips it, instead of paying for the same model calls twice
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -157,6 +157,8 @@ curl -X POST localhost:8000/v1/investigations -H "Authorization: Bearer ops_..."
   -d '{"question": "Payments are failing with ERR_POOL_TIMEOUT. What should I do?"}'
 ```
 
+Add `"background": true` to get `202` at once and have the worker run it; poll `GET /v1/investigations/{id}` until `status` isn't `running`.
+
 The response holds the answer, its citations (document, heading, chunk), token usage, latency, and the full trace of every model call and tool call. `GET /v1/investigations` and `GET /v1/investigations/{id}` (viewer) read them back.
 
 **How it works:** a LangGraph state machine.
@@ -176,6 +178,30 @@ agent --tool calls--> tools --> agent          ReAct: reason, act, observe, repe
 - **Observable:** every run stores its model calls, tool calls, tokens and latency per step, and logs a summary line.
 
 **Tests** run the real graph with a scripted chat model that plays back prepared replies (tool calls, drafts, reviewer verdicts). They cover the ReAct loop, revision, the step limit, unknown tools, made-up citations, workspace isolation, timeouts and failures, with no API calls. Tests always use the offline embedder and no real model, whatever `.env` says.
+
+## Incidents and alerts
+
+Point a monitoring tool's webhook at `POST /v1/alerts` with a responder API key as the bearer token. It accepts a simple format, or Prometheus Alertmanager's webhook format as is:
+
+```bash
+curl -X POST localhost:8000/v1/alerts -H "Authorization: Bearer ops_..." \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Payments API error rate above 5%", "severity": "critical",
+       "description": "ERR_POOL_TIMEOUT in payments-api logs",
+       "labels": {"service": "payments-api", "env": "prod"}}'
+```
+
+- **Deduplication:** every alert has a fingerprint, from the tool or computed from its title and labels (in any order). While an incident with that fingerprint is unresolved, repeats only increase its `alert_count`. It's a single `INSERT ... ON CONFLICT` against a partial unique index (`WHERE status <> 'resolved'`), so even 20 identical alerts arriving at the same instant open exactly one incident.
+- **Resolution:** a `resolved` alert closes its incident. If the problem comes back, that's a new incident.
+- **Automatic investigations:** a new incident at or above `AUTO_INVESTIGATE_SEVERITY` (default `high`) gets an investigation, queued for the worker only after the incident is committed. When the engineer opens the incident, the agent's answer and citations are often already there.
+- **Runs once:** a worker claims an investigation with a single `UPDATE ... WHERE started_at IS NULL`, so a task delivered twice runs (and is paid for) once. Investigations whose worker died are marked failed by the scheduler.
+- **Timeline:** opened, acknowledged, investigation started/completed/failed, resolved, in order.
+
+| Endpoint | Role |
+|---|---|
+| `POST /v1/alerts` | responder |
+| `GET /v1/incidents` (`?status=open`), `GET /v1/incidents/{id}` (timeline and investigation) | viewer |
+| `POST /v1/incidents/{id}/acknowledge`, `/resolve`, `/investigate` | responder |
 
 ## Checks
 

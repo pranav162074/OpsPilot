@@ -6,7 +6,15 @@ from redis.asyncio import Redis
 
 from opspilot import __version__
 from opspilot.agent.llm import build_chat_model
-from opspilot.api import api_keys, documents, health, investigations, search, workspaces
+from opspilot.api import (
+    api_keys,
+    documents,
+    health,
+    incidents,
+    investigations,
+    search,
+    workspaces,
+)
 from opspilot.api.errors import register_error_handlers
 from opspilot.config import Settings, get_settings
 from opspilot.db import create_engine, create_sessionmaker
@@ -15,7 +23,7 @@ from opspilot.embeddings.cache import QueryEmbeddingCache
 from opspilot.logging import configure_logging
 from opspilot.middleware import RequestIdMiddleware
 from opspilot.ratelimit import RateLimiter
-from opspilot.worker import enqueue_ingestion
+from opspilot.worker import enqueue_ingestion, enqueue_investigation
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -33,6 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.rate_limiter = RateLimiter(app.state.redis)
         # Swappable, so tests can capture what would be queued
         app.state.enqueue_ingestion = enqueue_ingestion
+        app.state.enqueue_investigation = enqueue_investigation
         app.state.embedder = build_embedder(settings)
         app.state.llm = build_chat_model(settings)
         app.state.query_cache = QueryEmbeddingCache(
@@ -54,6 +63,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(documents.router)
     app.include_router(search.router)
     app.include_router(investigations.router)
+    app.include_router(incidents.router)
     return app
 
 
