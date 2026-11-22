@@ -88,7 +88,10 @@ async def _clean(settings: Settings) -> None:
     engine = create_async_engine(settings.database_url)
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE workspaces, api_keys, documents, chunks, investigations CASCADE")
+            text(
+                "TRUNCATE workspaces, api_keys, documents, chunks, investigations, incidents,"
+                " incident_events CASCADE"
+            )
         )
     await engine.dispose()
     redis = Redis.from_url(settings.redis_url)
@@ -109,6 +112,14 @@ def enqueued(app: FastAPI) -> list[uuid.UUID]:
     """Document IDs the API queued for ingestion. Nothing reaches a real Celery broker."""
     queued: list[uuid.UUID] = []
     app.state.enqueue_ingestion = queued.append
+    return queued
+
+
+@pytest.fixture
+def queued_investigations(app: FastAPI) -> list[uuid.UUID]:
+    """Investigation IDs handed to the worker. Nothing reaches a real Celery broker."""
+    queued: list[uuid.UUID] = []
+    app.state.enqueue_investigation = queued.append
     return queued
 
 

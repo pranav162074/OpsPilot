@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     agent_timeout_seconds: float = 90.0
     investigations_per_hour: int = 30
 
+    # New incidents at or above this severity get an investigation started automatically
+    # ("none" switches that off)
+    auto_investigate_severity: Literal["critical", "high", "medium", "low", "none"] = "high"
+
     @field_validator("admin_token", mode="before")
     @classmethod
     def _blank_token_means_unset(cls, value: object) -> object:
