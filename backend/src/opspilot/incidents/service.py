@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
-from sqlalchemy import func, literal_column, text, update
+from sqlalchemy import Executable, func, literal_column, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,8 +70,7 @@ async def ingest_alert(
         session.add(IncidentEvent(incident_id=incident_id, type="resolved", data={"by": "alert"}))
         return AlertOutcome(fingerprint, "resolved", incident_id)
 
-    table = Incident.__table__
-    statement = (
+    statement: Executable = (
         insert(Incident)
         .values(
             id=uuid.uuid4(),
@@ -88,7 +87,8 @@ async def ingest_alert(
         .on_conflict_do_update(
             index_elements=["workspace_id", "fingerprint"],
             index_where=text("status <> 'resolved'"),
-            set_={"alert_count": table.c.alert_count + 1, "last_alert_at": func.now()},
+            # Incident.alert_count here is the existing row's value
+            set_={"alert_count": Incident.alert_count + 1, "last_alert_at": func.now()},
         )
         # xmax is 0 for a freshly inserted row: tells "opened" apart from "deduplicated"
         .returning(Incident.id, literal_column("(xmax = 0)").label("inserted"))
