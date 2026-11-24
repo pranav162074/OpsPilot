@@ -2,7 +2,7 @@
 
 An AI on-call assistant: retrieval over runbooks, incident write-ups and code, plus an agent that investigates production incidents using live metrics and logs.
 
-Work in progress.
+Work in progress: see [ROADMAP.md](ROADMAP.md) for every planned branch and where it stands.
 
 ## Running locally
 
@@ -202,6 +202,52 @@ curl -X POST localhost:8000/v1/alerts -H "Authorization: Bearer ops_..." \
 | `POST /v1/alerts` | responder |
 | `GET /v1/incidents` (`?status=open`), `GET /v1/incidents/{id}` (timeline and investigation) | viewer |
 | `POST /v1/incidents/{id}/acknowledge`, `/resolve`, `/investigate` | responder |
+
+## Using OpsPilot from Claude, Cursor and other AI assistants (MCP)
+
+OpsPilot is also an [MCP](https://modelcontextprotocol.io) server. An engineer can ask their assistant "what's firing, and what does our runbook say?" and the assistant calls OpsPilot itself.
+
+| Tool | What it does | Role |
+|---|---|---|
+| `search_docs` | Hybrid search over runbooks, postmortems and architecture notes | viewer |
+| `list_incidents`, `get_incident` | What's firing, with labels, timeline and the investigation's answer | viewer |
+| `get_investigation` | An investigation's answer and citations (optionally the full trace) | viewer |
+| `investigate` | Runs the agent and returns a cited, reviewed answer | responder |
+| `investigate_incident` | Starts a fresh background investigation of an incident | responder |
+| `acknowledge_incident`, `resolve_incident` | Changes the incident's state | responder |
+
+Plus a `triage_incident` prompt: incident summary, then runbook search, then cited next steps.
+
+**Connecting.** Use any OpsPilot API key; its role decides what the assistant may do (a viewer key makes a read-only assistant).
+
+```bash
+# Claude Code, or any client that speaks Streamable HTTP: the API serves MCP at /mcp
+claude mcp add --transport http opspilot http://localhost:8000/mcp \
+  --header "Authorization: Bearer ops_..."
+```
+
+Clients that launch a local command (Claude Desktop, Cursor) use the stdio server, which talks to a running OpsPilot:
+
+```json
+{
+  "mcpServers": {
+    "opspilot": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/OpsPilot/backend", "run", "opspilot-mcp"],
+      "env": { "OPSPILOT_URL": "http://localhost:8000", "OPSPILOT_API_KEY": "ops_..." }
+    }
+  }
+}
+```
+
+**Design:**
+
+- **A client of the REST API, not a second way in.** Every tool call goes through the same endpoints as any HTTP client, in-process inside the API with no network hop. So API-key auth, roles, per-key rate limits, validation and workspace isolation apply unchanged, and there is no duplicated logic to drift. A revoked key stops working on the very next MCP request.
+- **Keys checked at the door.** `/mcp` rejects requests without a valid key with a plain `401` before any MCP processing; that check doesn't spend the key's rate limit.
+- **Stateless Streamable HTTP.** Every MCP request stands alone, so any API instance behind a load balancer can answer it.
+- **Long calls stay alive.** `investigate` can take a minute or more, so it sends progress notifications every few seconds and clients don't time it out.
+- **Safety hints for the model.** Tools carry hints: read-only tools are marked read-only, and the tools that change shared state say in their descriptions to act only when the user asks. Errors come back as tool errors the model can read ("This API key's role isn't allowed to do that", "Rate limited; try again in 12 seconds"), not as crashes.
+- **Switching it off.** `MCP_ENABLED=false` turns off the `/mcp` endpoint.
 
 ## Checks
 

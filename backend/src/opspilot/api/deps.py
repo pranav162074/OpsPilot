@@ -71,6 +71,23 @@ class Principal:
         return Role(self.api_key.role)
 
 
+async def find_active_key(
+    session: AsyncSession, token: str, now: datetime
+) -> tuple[ApiKey, Workspace] | None:
+    """The key and its workspace, if the token is a valid, unrevoked, unexpired API key."""
+    if not looks_like_api_key(token):
+        return None
+    row = await session.execute(
+        select(ApiKey, Workspace)
+        .join(Workspace, Workspace.id == ApiKey.workspace_id)
+        .where(ApiKey.key_hash == hash_api_key(token))
+    )
+    found = row.one_or_none()
+    if found is None or not found.ApiKey.is_active(now):
+        return None
+    return found.ApiKey, found.Workspace
+
+
 async def authenticate(
     request: Request,
     response: Response,
@@ -87,18 +104,13 @@ async def authenticate(
     if not looks_like_api_key(token):
         raise _unauthorized("The API key is not valid")
 
-    row = await session.execute(
-        select(ApiKey, Workspace)
-        .join(Workspace, Workspace.id == ApiKey.workspace_id)
-        .where(ApiKey.key_hash == hash_api_key(token))
-    )
-    found = row.one_or_none()
     now = datetime.now(UTC)
+    found = await find_active_key(session, token, now)
     # Unknown, revoked and expired keys all get the same answer, so a caller learns nothing
-    if found is None or not found.ApiKey.is_active(now):
+    if found is None:
         raise _unauthorized("The API key is not valid")
 
-    api_key, workspace = found.ApiKey, found.Workspace
+    api_key, workspace = found
 
     # Limit per key, so one noisy client can't slow down the rest of its workspace
     result = await limiter.hit(f"key:{api_key.id}", settings.api_rate_limit_per_minute, 60)
