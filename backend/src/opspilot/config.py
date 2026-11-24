@@ -62,16 +62,19 @@ class Settings(BaseSettings):
     # The reviewer can send a draft back for one revision
     agent_reflection: bool = True
     agent_timeout_seconds: float = 90.0
+    # Serve the MCP tools at /mcp, for AI assistants such as Claude and Cursor
+    mcp_enabled: bool = True
     investigations_per_hour: int = 30
 
     # New incidents at or above this severity get an investigation started automatically
     # ("none" switches that off)
     auto_investigate_severity: Literal["critical", "high", "medium", "low", "none"] = "high"
 
-    @field_validator("admin_token", mode="before")
+    @field_validator("admin_token", "gemini_api_key", mode="before")
     @classmethod
-    def _blank_token_means_unset(cls, value: object) -> object:
-        # ADMIN_TOKEN= in .env must switch creation off, not accept an empty header
+    def _blank_secret_means_unset(cls, value: object) -> object:
+        # ADMIN_TOKEN= in .env must switch creation off, not accept an empty header; and
+        # GEMINI_API_KEY= (as in .env.example) must switch the agent off, not crash startup
         if isinstance(value, str) and not value.strip():
             return None
         return value
