@@ -1,0 +1,18 @@
+# Sends every Kuturl alert to OpsPilot's alert webhook, which turns it into an incident.
+# The OpsPilot API key is read from a file that demo/setup.sh writes (never committed).
+route:
+  receiver: opspilot
+  group_by: ["alertname", "service"]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: opspilot
+    webhook_configs:
+      # OpsPilot runs on your machine, outside Docker
+      - url: http://host.docker.internal:8000/v1/alerts
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials_file: /etc/alertmanager/secrets/opspilot_api_key

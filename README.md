@@ -203,6 +203,40 @@ curl -X POST localhost:8000/v1/alerts -H "Authorization: Bearer ops_..." \
 | `GET /v1/incidents` (`?status=open`), `GET /v1/incidents/{id}` (timeline and investigation) | viewer |
 | `POST /v1/incidents/{id}/acknowledge`, `/resolve`, `/investigate` | responder |
 
+## Telemetry: metrics, logs and changes
+
+Runbooks say what *should* be checked; telemetry shows what *is* happening. A workspace connects its own Prometheus, Loki and GitHub repository, and CI reports deploys. The agent then checks the evidence before it answers, and cites it.
+
+| Endpoint | What it does | Role |
+|---|---|---|
+| `PUT /v1/integrations/{prometheus\|loki\|github}` | Connect a source: URL, optional bearer token, repository for GitHub | admin |
+| `POST /v1/integrations/{kind}/check` | Try the saved connection | admin |
+| `GET /v1/integrations`, `DELETE .../{kind}` | List (tokens never returned), disconnect | viewer / admin |
+| `POST /v1/deploys`, `GET /v1/deploys` | CI records each release; list them | responder / viewer |
+| `POST /v1/telemetry/metrics` | PromQL over the last 1-360 minutes, summarised per series | viewer |
+| `GET /v1/telemetry/metric-names?contains=` | Metric names, to write correct queries | viewer |
+| `POST /v1/telemetry/logs` | A service's newest log lines, optionally containing some text | viewer |
+| `GET /v1/telemetry/changes?hours=` | Deploys and GitHub commits merged, newest first | viewer |
+
+**The agent's new tools:**
+
+- `query_metrics`, `list_metric_names`, `search_logs` and `recent_changes` are offered only when the matching integration is connected, so the model never calls a tool that can't work. `recent_changes` is always available, since deploys are stored in OpsPilot.
+- Every telemetry result gets a citation id, just like a document passage. The answer cites the metric or log lines behind each claim, and the reviewer checks the draft against that same evidence. A citation now carries a `kind` (`document`, `metrics`, `logs` or `changes`).
+- Results are bounded before they reach the model:
+  - at most 10 series per query, each reduced to last, min, max, average and 8 samples, with the series that moved most first;
+  - at most 100 log lines, each cut to 400 characters;
+  - windows capped at 6 hours.
+- Failures (Prometheus down, a bad query, GitHub's rate limit) come back to the model as text it can reason about, not as crashes. If GitHub can't be read, deploys are still listed, with a warning.
+
+**Security:**
+
+- **Tokens encrypted at rest:** integration tokens are encrypted with a Fernet key (`INTEGRATIONS_KEY`) that lives only in the server's environment, so a database dump doesn't leak a team's Grafana or GitHub tokens. Tokens are never returned by the API.
+- **SSRF protection:** integration URLs are chosen by workspace admins, and the server makes requests to them. In production every request's host is resolved and must be a public address. That blocks `localhost`, private networks and the cloud metadata endpoint `169.254.169.254`, and the check is repeated on every request, not only when the URL is saved (DNS rebinding). Redirects are not followed. Private addresses are allowed in development, for a local Prometheus.
+- **No query injection:** the model can't write arbitrary LogQL. It names a service (validated) and a text filter (escaped), and OpsPilot builds the query. PromQL is read-only by nature, and is bounded in length and time range.
+- **Untrusted logs:** log lines are untrusted input. The agent's instructions tell it to treat tool output as data, never as instructions.
+
+**The demo ([demo/](demo/README.md)):** Kuturl, a real URL shortener, runs next to OpsPilot in Docker with Prometheus, Alertmanager, Loki and Alloy, all free and local. `bash demo/simulate.sh redis-down` (or `db-lock`, `traffic-flood`, `bad-deploy`) breaks it in a known way. Prometheus alerts, Alertmanager creates an OpsPilot incident, and the agent investigates with metrics, logs, deploys and runbooks. Each run's true root cause is recorded, which is the ground truth for evaluating the agent next. The full alert pipeline was verified end to end before merging.
+
 ## Using OpsPilot from Claude, Cursor and other AI assistants (MCP)
 
 OpsPilot is also an [MCP](https://modelcontextprotocol.io) server. An engineer can ask their assistant "what's firing, and what does our runbook say?" and the assistant calls OpsPilot itself.
@@ -212,6 +246,7 @@ OpsPilot is also an [MCP](https://modelcontextprotocol.io) server. An engineer c
 | `search_docs` | Hybrid search over runbooks, postmortems and architecture notes | viewer |
 | `list_incidents`, `get_incident` | What's firing, with labels, timeline and the investigation's answer | viewer |
 | `get_investigation` | An investigation's answer and citations (optionally the full trace) | viewer |
+| `query_metrics`, `list_metric_names`, `search_logs`, `recent_changes` | The workspace's telemetry (see above) | viewer |
 | `investigate` | Runs the agent and returns a cited, reviewed answer | responder |
 | `investigate_incident` | Starts a fresh background investigation of an incident | responder |
 | `acknowledge_incident`, `resolve_incident` | Changes the incident's state | responder |

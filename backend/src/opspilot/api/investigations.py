@@ -26,10 +26,13 @@ class InvestigationRequest(BaseModel):
 
 
 class CitationOut(BaseModel):
+    # For telemetry observations, chunk_id identifies the observation and document_id is null
     chunk_id: uuid.UUID
-    document_id: uuid.UUID
+    document_id: uuid.UUID | None
     document_title: str
     heading: str
+    # "document", or "metrics", "logs" or "changes" for telemetry the agent looked at
+    kind: str = "document"
 
 
 class Usage(BaseModel):
@@ -142,6 +145,7 @@ async def create_investigation(
         settings=settings,
         embedder=request.app.state.embedder,
         query_cache=request.app.state.query_cache,
+        telemetry_http=request.app.state.telemetry_http,
     )
     if outcome == RunOutcome.TIMED_OUT:
         raise ApiError(504, "agent_timeout", "The investigation took too long")

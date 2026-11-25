@@ -1,5 +1,9 @@
 # Local infrastructure for development. The API itself runs on your machine (uv run ...),
 # so code changes reload instantly without rebuilding images.
+#
+#   docker compose up -d                   Postgres and Redis for OpsPilot
+#   docker compose --profile demo up -d    ...plus Kuturl and its telemetry: the system that
+#                                          OpsPilot investigates (see demo/README.md)
 name: opspilot
 
 services:
@@ -35,6 +39,137 @@ services:
       timeout: 3s
       retries: 10
 
+  # ------------------------------------------------------------------------------------
+  # The demo: Kuturl (a real service), with metrics, logs and alerts wired to OpsPilot
+  # ------------------------------------------------------------------------------------
+
+  kuturl-postgres:
+    image: postgres:17-alpine
+    profiles: ["demo"]
+    environment:
+      POSTGRES_USER: kuturl
+      POSTGRES_PASSWORD: kuturl
+      POSTGRES_DB: kuturl
+    volumes:
+      - kuturl-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kuturl -d kuturl"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kuturl-redis:
+    image: redis:7-alpine
+    profiles: ["demo"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kuturl:
+    build: ./demo/kuturl
+    image: opspilot-demo-kuturl
+    profiles: ["demo"]
+    restart: unless-stopped
+    depends_on:
+      kuturl-postgres:
+        condition: service_healthy
+      kuturl-redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      PUBLIC_URL: http://localhost:3001
+      # The "bad deploy" scenario changes this password to break the database connection
+      DATABASE_URL: postgresql://kuturl:${KUTURL_DB_PASSWORD:-kuturl}@kuturl-postgres:5432/kuturl
+      REDIS_URL: redis://kuturl-redis:6379
+      CODE_SECRET: demo-code-secret-0123456789
+      RUN_WORKER: "true"
+      REDIS_KEY_PREFIX: "demo:"
+      TRUST_PROXY: "0"
+      LOG_LEVEL: info
+      # Demo-only token; Prometheus sends it to read /metrics
+      METRICS_TOKEN: demo-metrics-token-0123456789
+    ports:
+      - "3001:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+  traffic:
+    # Same image as Kuturl: it has the traffic script and autocannon for load tests
+    build: ./demo/kuturl
+    image: opspilot-demo-kuturl
+    profiles: ["demo"]
+    restart: unless-stopped
+    depends_on:
+      - kuturl
+    command: ["node", "/traffic/traffic.mjs"]
+    environment:
+      KUTURL_URL: http://kuturl:3000
+      TRAFFIC_RPS: "8"
+    volumes:
+      - traffic-state:/state
+
+  kuturl-redis-exporter:
+    image: oliver006/redis_exporter:v1.99.0
+    profiles: ["demo"]
+    environment:
+      REDIS_ADDR: redis://kuturl-redis:6379
+
+  kuturl-postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.21.1
+    profiles: ["demo"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://kuturl:kuturl@kuturl-postgres:5432/kuturl?sslmode=disable
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    profiles: ["demo"]
+    volumes:
+      - ./demo/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./demo/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  alertmanager:
+    image: prom/alertmanager:v0.35.0
+    profiles: ["demo"]
+    volumes:
+      - ./demo/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./demo/alertmanager/secrets:/etc/alertmanager/secrets:ro
+    # Lets the container reach OpsPilot on your machine (built in on Docker Desktop)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9093:9093"
+
+  loki:
+    image: grafana/loki:3.7.10
+    profiles: ["demo"]
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+
+  alloy:
+    image: grafana/alloy:v1.22.0
+    profiles: ["demo"]
+    command: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data"]
+    volumes:
+      - ./demo/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Reads container logs through Docker (works on Docker Desktop for Windows and Mac too)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
 volumes:
   pgdata:
   redisdata:
+  kuturl-pgdata:
+  traffic-state:
+  prometheus-data:

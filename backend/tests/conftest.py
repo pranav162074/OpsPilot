@@ -24,6 +24,9 @@ from opspilot.main import create_app
 ADMIN_TOKEN = "test-admin-token"
 
 
+TEST_INTEGRATIONS_KEY = "x1VYkO0tCXOuwtq2B8JKxqOTOGiTbXg8vY1ZVuCtEEk="
+
+
 def _test_settings(**overrides: Any) -> Settings:
     base = get_settings()
     db_url = make_url(base.database_url)
@@ -38,6 +41,8 @@ def _test_settings(**overrides: Any) -> Settings:
         # language model unless a test installs a scripted one
         "embedding_provider": "hashing",
         "gemini_api_key": None,
+        # A fixed test key, so integration tokens can be stored; never use it anywhere else
+        "integrations_key": TEST_INTEGRATIONS_KEY,
     }
     values.update(overrides)
     return Settings(**values)
