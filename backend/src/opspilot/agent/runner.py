@@ -10,6 +10,7 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import httpx
 from langchain_core.language_models import BaseChatModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -68,7 +69,8 @@ async def _finish(
             row.citations = [
                 {
                     "chunk_id": str(c.chunk_id),
-                    "document_id": str(c.document_id),
+                    "document_id": str(c.document_id) if c.document_id else None,
+                    "kind": c.kind,
                     "document_title": c.document_title,
                     "heading": c.heading,
                 }
@@ -93,6 +95,7 @@ async def execute_investigation(
     settings: Settings,
     embedder: Embedder,
     query_cache: QueryEmbeddingCache,
+    telemetry_http: httpx.AsyncClient | None = None,
 ) -> RunOutcome:
     async with sessionmaker() as session:
         claimed = (
@@ -125,6 +128,7 @@ async def execute_investigation(
             workspace_id=claimed.workspace_id,
             question=claimed.question,
             source_types=[SourceType(s) for s in claimed.source_types or []] or None,
+            telemetry_http=telemetry_http,
         )
     except TimeoutError:
         await _finish(

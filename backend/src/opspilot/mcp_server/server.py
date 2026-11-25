@@ -31,6 +31,8 @@ Typical flow while helping someone on call:
 1. list_incidents / get_incident to see what's firing and its timeline.
 2. search_docs for the runbook or a past postmortem about the symptom (exact error codes and
    hostnames work well as queries, so do plain descriptions).
+   query_metrics, search_logs and recent_changes show what is actually happening and what
+   changed, when the workspace has its Prometheus, Loki and deploys connected.
 3. investigate for a cited, reviewed answer when the fix isn't obvious from one passage.
 4. acknowledge_incident when someone takes it, resolve_incident when it's fixed. These change
    shared state the whole team sees: only do them when the user asks.
@@ -81,7 +83,12 @@ def _investigation_brief(row: dict[str, Any], include_trace: bool = False) -> di
         "status": row["status"],
         "answer": row["answer"],
         "citations": [
-            {"document": c["document_title"], "heading": c["heading"], "chunk_id": c["chunk_id"]}
+            {
+                "document": c["document_title"],
+                "heading": c["heading"],
+                "chunk_id": c["chunk_id"],
+                "kind": c.get("kind", "document"),
+            }
             for c in row["citations"]
         ],
         "error": row["error"],
@@ -259,6 +266,69 @@ def build_server(api_for: ApiFactory, *, agent_timeout_seconds: float = 90.0) ->
         finished: check again shortly."""
         row = await api_for(ctx).call("GET", f"/v1/investigations/{investigation_id}")
         return _investigation_brief(row, include_trace)
+
+    @server.tool(annotations=READ_ONLY)
+    async def query_metrics(
+        promql: Annotated[str, Field(min_length=1, max_length=500, description="PromQL")],
+        ctx: Context,
+        minutes: Annotated[int, Field(ge=1, le=360, description="How far back")] = 60,
+    ) -> dict[str, Any]:
+        """Query the workspace's Prometheus over a recent window. Returns each series' last,
+        min, max and average plus a few samples over time, the series that moved most first.
+        Use list_metric_names first if unsure of a metric's name."""
+        return dict(
+            await api_for(ctx).call(
+                "POST", "/v1/telemetry/metrics", json_body={"query": promql, "minutes": minutes}
+            )
+        )
+
+    @server.tool(annotations=READ_ONLY)
+    async def list_metric_names(
+        ctx: Context,
+        contains: Annotated[str | None, Field(max_length=100)] = None,
+    ) -> dict[str, Any]:
+        """Metric names known to the workspace's Prometheus, optionally filtered by a substring."""
+        names = await api_for(ctx).call(
+            "GET", "/v1/telemetry/metric-names", params={"contains": contains}
+        )
+        return {"metric_names": names}
+
+    @server.tool(annotations=READ_ONLY)
+    async def search_logs(
+        service: Annotated[str, Field(min_length=1, max_length=100)],
+        ctx: Context,
+        contains: Annotated[
+            str | None, Field(max_length=200, description="Only lines containing this text")
+        ] = None,
+        minutes: Annotated[int, Field(ge=1, le=360)] = 30,
+        limit: Annotated[int, Field(ge=1, le=100)] = 50,
+    ) -> dict[str, Any]:
+        """A service's most recent log lines from the workspace's Loki, newest first."""
+        data = await api_for(ctx).call(
+            "POST",
+            "/v1/telemetry/logs",
+            json_body={
+                "service": service,
+                "contains": contains,
+                "minutes": minutes,
+                "limit": limit,
+            },
+        )
+        return {"query": data["query"], "lines": [f"{x['at']} {x['line']}" for x in data["lines"]]}
+
+    @server.tool(annotations=READ_ONLY)
+    async def recent_changes(
+        ctx: Context,
+        hours: Annotated[int, Field(ge=1, le=336)] = 24,
+        service: Annotated[str | None, Field(max_length=100)] = None,
+    ) -> dict[str, Any]:
+        """Recent deploys (reported by CI) and commits (when GitHub is connected), newest first.
+        Problems that start right after a change are often caused by it."""
+        return dict(
+            await api_for(ctx).call(
+                "GET", "/v1/telemetry/changes", params={"hours": hours, "service": service}
+            )
+        )
 
     @server.prompt(title="Triage an incident")
     def triage_incident(incident_id: str) -> str:

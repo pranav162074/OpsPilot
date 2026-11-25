@@ -25,10 +25,10 @@ The plan OpsPilot is built against: one branch at a time, each with tests, a pul
 
 | # | Planned branch | Status | Delivered in | Still missing |
 |---|---|---|---|---|
-| 8 | `feat/telemetry-tools` | ⬜ | | Prometheus, log-search and commits/deploys tools; Kuturl in Compose; the Bash incident simulator |
+| 8 | `feat/telemetry-tools` | 🔨 | `feat/telemetry-tools`: Prometheus, Loki, GitHub and deploy tools for the agent (and API, MCP); encrypted tokens, SSRF protection; Kuturl, Prometheus, Alertmanager, Loki and Alloy in Compose; the incident simulator with recorded ground truth | |
 | 9 | `feat/investigation-agent` | 🟡 | #5 `feat/investigation-agent`: LangGraph agent, step limit, timeout, saved traces, background runs | plan → parallel evidence → hypotheses → verify flow, token budget, resumable runs, human approval |
 | 10 | `feat/incident-lifecycle` | 🟡 | #6 `feat/incidents`: open → acknowledged → resolved, Alertmanager webhook, automatic investigations, timeline | Draft postmortems |
-| 11 | `feat/mcp-server` | 🔨 | `feat/mcp-server` | |
+| 11 | `feat/mcp-server` | ✅ | #7 `feat/mcp-server` | |
 
 ## Phase 4: Production-grade (resume checkpoint 3)
 

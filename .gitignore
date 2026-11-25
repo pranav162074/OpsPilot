@@ -16,3 +16,8 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+# Demo: the OpsPilot key Alertmanager uses, and the simulator's records
+demo/alertmanager/secrets/*
+!demo/alertmanager/secrets/.gitkeep
+demo/.demo-env
+demo/simulations.jsonl

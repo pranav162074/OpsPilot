@@ -1,0 +1,68 @@
+# Alerts for Kuturl. Each one becomes an OpsPilot incident; high and critical ones get an
+# investigation started automatically. Thresholds are tuned for the demo's light traffic.
+groups:
+  - name: kuturl
+    rules:
+      - alert: KuturlDown
+        expr: up{job="kuturl"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: kuturl
+        annotations:
+          summary: Kuturl is down
+          description: Prometheus can't scrape Kuturl's /metrics, so the process is down or not answering.
+
+      - alert: KuturlRedisDown
+        expr: redis_up{job="kuturl-redis"} == 0
+        for: 30s
+        labels:
+          severity: high
+          service: kuturl
+        annotations:
+          summary: Kuturl's Redis is down
+          description: The Redis exporter can't reach Kuturl's Redis (cache, rate limits, click stream).
+
+      - alert: KuturlHighLatency
+        expr: >
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{job="kuturl"}[1m]))) > 0.5
+        for: 1m
+        labels:
+          severity: high
+          service: kuturl
+        annotations:
+          summary: Kuturl is slow
+          description: 95th-percentile response time over the last minute is above 500 ms.
+
+      - alert: KuturlHighErrorRate
+        expr: >
+          sum(rate(http_request_duration_seconds_count{job="kuturl", status=~"5.."}[1m]))
+            / sum(rate(http_request_duration_seconds_count{job="kuturl"}[1m])) > 0.05
+        for: 1m
+        labels:
+          severity: high
+          service: kuturl
+        annotations:
+          summary: Kuturl is returning errors
+          description: More than 5% of Kuturl's responses over the last minute were 5xx errors.
+
+      - alert: KuturlTrafficSpike
+        expr: sum(rate(http_request_duration_seconds_count{job="kuturl"}[1m])) > 150
+        for: 30s
+        labels:
+          severity: medium
+          service: kuturl
+        annotations:
+          summary: Kuturl traffic spike
+          description: Kuturl is serving more than 150 requests a second, far above its usual load.
+
+      - alert: KuturlDatabaseLocked
+        expr: sum(pg_locks_count{datname="kuturl", mode="accessexclusivelock"}) > 0
+        for: 30s
+        labels:
+          severity: medium
+          service: kuturl
+        annotations:
+          summary: A Kuturl table is exclusively locked
+          description: Something holds an ACCESS EXCLUSIVE lock in Kuturl's database; queries on that table wait.

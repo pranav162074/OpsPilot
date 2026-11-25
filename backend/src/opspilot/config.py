@@ -66,15 +66,38 @@ class Settings(BaseSettings):
     mcp_enabled: bool = True
     investigations_per_hour: int = 30
 
+    # Telemetry integrations (Prometheus, Loki, GitHub). Their tokens are encrypted with this
+    # Fernet key; without it, integrations work only without tokens. Make one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    integrations_key: SecretStr | None = None
+    # Integration URLs may point at localhost and private networks (a local Prometheus).
+    # Unset means: allowed except in production, where it would let a workspace admin make
+    # the server probe its own internal network (SSRF).
+    integrations_allow_private_urls: bool | None = None
+    telemetry_timeout_seconds: float = 10.0
+
     # New incidents at or above this severity get an investigation started automatically
     # ("none" switches that off)
     auto_investigate_severity: Literal["critical", "high", "medium", "low", "none"] = "high"
 
-    @field_validator("admin_token", "gemini_api_key", mode="before")
+    @property
+    def allow_private_integration_urls(self) -> bool:
+        if self.integrations_allow_private_urls is not None:
+            return self.integrations_allow_private_urls
+        return self.environment != "production"
+
+    @field_validator(
+        "admin_token",
+        "gemini_api_key",
+        "integrations_key",
+        "integrations_allow_private_urls",
+        mode="before",
+    )
     @classmethod
     def _blank_secret_means_unset(cls, value: object) -> object:
         # ADMIN_TOKEN= in .env must switch creation off, not accept an empty header; and
-        # GEMINI_API_KEY= (as in .env.example) must switch the agent off, not crash startup
+        # GEMINI_API_KEY= (as in .env.example) must switch the agent off, not crash startup;
+        # other blank values mean "use the default"
         if isinstance(value, str) and not value.strip():
             return None
         return value

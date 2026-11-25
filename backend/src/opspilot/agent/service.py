@@ -6,16 +6,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from opspilot.agent.graph import CITATION, Trace, build_graph, cited_ids, text_of
-from opspilot.agent.tools import Retrieved, build_tools
+from opspilot.agent.tools import Retrieved, build_telemetry_tools, build_tools
 from opspilot.config import Settings
 from opspilot.embeddings import Embedder
 from opspilot.embeddings.cache import QueryEmbeddingCache
 from opspilot.models import SourceType
+from opspilot.telemetry.service import load_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +25,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Citation:
     chunk_id: uuid.UUID
-    document_id: uuid.UUID
+    document_id: uuid.UUID | None
     document_title: str
     heading: str
+    kind: str = "document"
 
 
 @dataclass
@@ -51,6 +54,7 @@ async def run_investigation(
     workspace_id: uuid.UUID,
     question: str,
     source_types: Sequence[SourceType] | None = None,
+    telemetry_http: httpx.AsyncClient | None = None,
 ) -> InvestigationResult:
     started = time.perf_counter()
     retrieved = Retrieved()
@@ -64,6 +68,15 @@ async def run_investigation(
         retrieved=retrieved,
         default_source_types=source_types,
     )
+    if telemetry_http is not None:
+        async with sessionmaker() as session:
+            telemetry = await load_telemetry(session, workspace_id, telemetry_http, settings)
+        tools += build_telemetry_tools(
+            sessionmaker=sessionmaker,
+            telemetry=telemetry,
+            workspace_id=workspace_id,
+            retrieved=retrieved,
+        )
     graph = build_graph(
         llm,
         tools,
@@ -97,6 +110,7 @@ async def run_investigation(
             document_id=s.document_id,
             document_title=s.document_title,
             heading=s.heading,
+            kind=s.kind,
         )
         for s in (retrieved.sources[i] for i in cited_ids(answer))
     ]

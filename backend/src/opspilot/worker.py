@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 from celery import Celery, Task
 from celery.signals import setup_logging
 from redis.asyncio import Redis
@@ -149,6 +150,9 @@ def run_investigation_task(investigation_id: str, request_id: str = "-") -> str:
             llm = build_chat_model(settings)
             embedder = build_embedder(settings)
             redis = Redis.from_url(settings.redis_url, socket_connect_timeout=2)
+            telemetry_http = httpx.AsyncClient(
+                timeout=settings.telemetry_timeout_seconds, follow_redirects=False
+            )
             try:
                 if llm is None:
                     await mark_unrunnable(sessionmaker, uuid.UUID(investigation_id))
@@ -160,8 +164,10 @@ def run_investigation_task(investigation_id: str, request_id: str = "-") -> str:
                     settings=settings,
                     embedder=embedder,
                     query_cache=QueryEmbeddingCache(redis, settings.query_embedding_cache_seconds),
+                    telemetry_http=telemetry_http,
                 )
             finally:
+                await telemetry_http.aclose()
                 await embedder.aclose()
                 await redis.aclose()
 

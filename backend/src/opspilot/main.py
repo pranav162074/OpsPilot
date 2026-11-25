@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
@@ -13,6 +14,7 @@ from opspilot.api import (
     incidents,
     investigations,
     search,
+    telemetry,
     workspaces,
 )
 from opspilot.api.errors import register_error_handlers
@@ -49,12 +51,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.query_cache = QueryEmbeddingCache(
             app.state.redis, settings.query_embedding_cache_seconds
         )
+        # Prometheus, Loki and GitHub requests; no redirects, so a saved URL can't bounce
+        # the server somewhere else
+        app.state.telemetry_http = httpx.AsyncClient(
+            timeout=settings.telemetry_timeout_seconds, follow_redirects=False
+        )
         try:
             async with AsyncExitStack() as stack:
                 if mcp is not None:
                     await stack.enter_async_context(mcp.running())
                 yield
         finally:
+            await app.state.telemetry_http.aclose()
             await app.state.embedder.aclose()
             await app.state.redis.aclose()
             await app.state.engine.dispose()
@@ -69,6 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(search.router)
     app.include_router(investigations.router)
     app.include_router(incidents.router)
+    app.include_router(telemetry.router)
     if settings.mcp_enabled:
         # The same tools for AI assistants, at /mcp (see opspilot/mcp_server)
         mcp = McpEndpoint(app, settings)

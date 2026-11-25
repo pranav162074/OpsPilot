@@ -123,8 +123,20 @@ async def test_lists_the_tools_with_safety_hints_and_the_triage_prompt(
         "investigate",
         "investigate_incident",
         "get_investigation",
+        "query_metrics",
+        "list_metric_names",
+        "search_logs",
+        "recent_changes",
     }
-    for name in ("search_docs", "list_incidents", "get_incident", "get_investigation"):
+    for name in (
+        "search_docs",
+        "list_incidents",
+        "get_incident",
+        "get_investigation",
+        "query_metrics",
+        "search_logs",
+        "recent_changes",
+    ):
         annotations = tools[name].annotations
         assert annotations is not None and annotations.read_only_hint is True, name
     acknowledge = tools["acknowledge_incident"].annotations
