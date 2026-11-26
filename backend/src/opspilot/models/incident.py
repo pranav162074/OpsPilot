@@ -81,6 +81,13 @@ class Incident(IdMixin, CreatedAtMixin, Base):
     investigation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("investigations.id", ondelete="SET NULL")
     )
+    # A postmortem the agent drafted from the timeline and the investigation. It's only
+    # searchable once someone publishes it (it becomes a postmortem document)
+    postmortem_draft: Mapped[str | None] = mapped_column(Text)
+    postmortem_drafted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    postmortem_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL")
+    )
 
 
 class IncidentEvent(IdMixin, CreatedAtMixin, Base):

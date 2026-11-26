@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from opspilot.agent.graph import CITATION, Trace, build_graph, cited_ids, text_of
+from opspilot.agent.planner import PlanState, build_plan_graph, initial_state, split_actions
 from opspilot.agent.tools import Retrieved, build_telemetry_tools, build_tools
 from opspilot.config import Settings
 from opspilot.embeddings import Embedder
@@ -42,6 +43,31 @@ class InvestigationResult:
     revised: bool
     sources_considered: int = 0
     events: list[dict[str, Any]] = field(default_factory=list)
+    strategy: str = "react"
+    # "plan" runs: each cause considered, the check run for it and the verdict
+    hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    # Changes the agent suggests making; a person approves or rejects each one
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    budget_exhausted: bool = False
+    resumed_from: str | None = None
+
+
+# What a "plan" run stores after each stage, to resume from if its worker dies
+Checkpoint = dict[str, Any]
+
+
+def make_checkpoint(state: PlanState, retrieved: Retrieved, trace: Trace) -> Checkpoint:
+    return {"state": dict(state), "sources": retrieved.to_json(), "trace": trace.to_json()}
+
+
+def _clean_citations(text: str, retrieved: Retrieved) -> tuple[str, list[uuid.UUID]]:
+    """Drops citations of anything the tools never showed the model (a hallucinated id)."""
+    invalid = [i for i in cited_ids(text) if i not in retrieved.sources]
+    if invalid:
+        text = CITATION.sub(
+            lambda m: "" if uuid.UUID(m.group(1)) in invalid else m.group(0), text
+        ).strip()
+    return text, invalid
 
 
 async def run_investigation(
@@ -55,10 +81,14 @@ async def run_investigation(
     question: str,
     source_types: Sequence[SourceType] | None = None,
     telemetry_http: httpx.AsyncClient | None = None,
+    strategy: str = "react",
+    checkpoint: Checkpoint | None = None,
+    on_checkpoint: Callable[[Checkpoint], Awaitable[None]] | None = None,
 ) -> InvestigationResult:
     started = time.perf_counter()
-    retrieved = Retrieved()
-    trace = Trace()
+    resume = checkpoint if strategy == "plan" and checkpoint else None
+    retrieved = Retrieved.from_json(resume["sources"]) if resume else Retrieved()
+    trace = Trace.from_json(resume["trace"]) if resume else Trace()
     tools = build_tools(
         sessionmaker=sessionmaker,
         settings=settings,
@@ -77,33 +107,61 @@ async def run_investigation(
             workspace_id=workspace_id,
             retrieved=retrieved,
         )
-    graph = build_graph(
-        llm,
-        tools,
-        retrieved,
-        trace,
-        question=question,
-        max_steps=settings.agent_max_steps,
-        reflection=settings.agent_reflection,
-    )
-    async with asyncio.timeout(settings.agent_timeout_seconds):
-        state = await graph.ainvoke(
-            {"messages": [HumanMessage(question)], "steps": 0, "revisions": 0},
-            # Each agent step is two graph steps (agent, tools), plus review and revision
-            {"recursion_limit": settings.agent_max_steps * 4 + 10},
-        )
+    hypotheses: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    if strategy == "plan":
 
-    answer_message = next(
-        m for m in reversed(state["messages"]) if isinstance(m, AIMessage) and not m.tool_calls
-    )
-    answer = text_of(answer_message).strip()
+        async def save(state: PlanState) -> None:
+            if on_checkpoint is not None:
+                await on_checkpoint(make_checkpoint(state, retrieved, trace))
+
+        plan_graph = build_plan_graph(
+            llm,
+            tools,
+            retrieved,
+            trace,
+            max_parallel=settings.agent_max_parallel_tools,
+            tool_timeout=settings.agent_tool_timeout_seconds,
+            max_hypotheses=settings.agent_max_hypotheses,
+            token_budget=settings.agent_token_budget,
+            reflection=settings.agent_reflection,
+            on_checkpoint=save,
+        )
+        start_state: PlanState = resume["state"] if resume else initial_state(question)
+        async with asyncio.timeout(settings.agent_timeout_seconds):
+            final: PlanState = await plan_graph.ainvoke(start_state, {"recursion_limit": 20})
+        answer, actions = split_actions(final["draft"])
+        hypotheses = final["hypotheses"]
+        revised = final["revisions"] > 0
+        budget_exhausted = final["budget_exhausted"]
+    else:
+        graph = build_graph(
+            llm,
+            tools,
+            retrieved,
+            trace,
+            question=question,
+            max_steps=settings.agent_max_steps,
+            reflection=settings.agent_reflection,
+            token_budget=settings.agent_token_budget,
+        )
+        async with asyncio.timeout(settings.agent_timeout_seconds):
+            state = await graph.ainvoke(
+                {"messages": [HumanMessage(question)], "steps": 0, "revisions": 0},
+                # Each agent step is two graph steps (agent, tools), plus review and revision
+                {"recursion_limit": settings.agent_max_steps * 4 + 10},
+            )
+        answer_message = next(
+            m for m in reversed(state["messages"]) if isinstance(m, AIMessage) and not m.tool_calls
+        )
+        answer = text_of(answer_message).strip()
+        revised = state["revisions"] > 0
+        budget_exhausted = 0 < settings.agent_token_budget <= trace.tokens
 
     # A citation is only trusted if the tools actually showed the model that passage
-    invalid = [i for i in cited_ids(answer) if i not in retrieved.sources]
-    if invalid:
-        answer = CITATION.sub(
-            lambda m: "" if uuid.UUID(m.group(1)) in invalid else m.group(0), answer
-        ).strip()
+    answer, invalid = _clean_citations(answer, retrieved)
+    for action in actions:
+        action["citations"] = [c for c in action["citations"] if _is_known(c, retrieved)]
     citations = [
         Citation(
             chunk_id=s.chunk_id,
@@ -126,6 +184,9 @@ async def run_investigation(
                 "latency_ms": latency_ms,
                 "citations": len(citations),
                 "invalid_citations": len(invalid),
+                "strategy": strategy,
+                "budget_exhausted": budget_exhausted,
+                "resumed_from": resume["state"]["stage"] if resume else None,
             }
         },
     )
@@ -135,7 +196,19 @@ async def run_investigation(
         invalid_citations=len(invalid),
         trace=trace,
         latency_ms=latency_ms,
-        revised=state["revisions"] > 0,
+        revised=revised,
         sources_considered=len(retrieved.sources),
         events=trace.events,
+        strategy=strategy,
+        hypotheses=hypotheses,
+        actions=actions,
+        budget_exhausted=budget_exhausted,
+        resumed_from=resume["state"]["stage"] if resume else None,
     )
+
+
+def _is_known(citation: str, retrieved: Retrieved) -> bool:
+    try:
+        return uuid.UUID(citation.removeprefix("c:")) in retrieved.sources
+    except ValueError:
+        return False

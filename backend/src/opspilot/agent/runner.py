@@ -3,23 +3,35 @@
 The investigation row is created first, as "running". The runner claims it with a single
 UPDATE (so a task delivered twice runs once), runs the agent, and writes the outcome back,
 including to the incident that asked for it, if any.
+
+Runs are resumable. A "plan" run stores its state after every stage (and that doubles as a
+heartbeat). If its worker dies, recover_abandoned_investigations() notices the silence,
+releases the claim and queues it again, and the next runner carries on from the last
+finished stage, up to agent_max_attempts claims in all.
 """
 
 import enum
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import httpx
 from langchain_core.language_models import BaseChatModel
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from opspilot.agent.service import InvestigationResult, run_investigation
+from opspilot.agent.service import Checkpoint, InvestigationResult, run_investigation
 from opspilot.config import Settings
 from opspilot.embeddings import Embedder
 from opspilot.embeddings.cache import QueryEmbeddingCache
-from opspilot.models import Investigation, InvestigationStatus, SourceType
+from opspilot.models import (
+    ActionStatus,
+    Investigation,
+    InvestigationAction,
+    InvestigationStatus,
+    SourceType,
+)
 from opspilot.models.incident import Incident, IncidentEvent
 
 logger = logging.getLogger(__name__)
@@ -59,6 +71,7 @@ async def _finish(
         if row is None:
             return
         row.completed_at = datetime.now(UTC)
+        row.checkpoint = None  # finished either way: nothing left to resume
         if result is None:
             row.status = InvestigationStatus.FAILED.value
             row.error = error
@@ -83,6 +96,18 @@ async def _finish(
             row.input_tokens = result.trace.input_tokens
             row.output_tokens = result.trace.output_tokens
             row.latency_ms = result.latency_ms
+            row.hypotheses = result.hypotheses
+            row.budget_exhausted = result.budget_exhausted
+            for position, action in enumerate(result.actions):
+                session.add(
+                    InvestigationAction(
+                        workspace_id=row.workspace_id,
+                        investigation_id=row.id,
+                        position=position,
+                        status=ActionStatus.PROPOSED.value,
+                        **action,
+                    )
+                )
             await _record_on_incident(session, investigation_id, "investigation_completed")
         await session.commit()
 
@@ -106,17 +131,43 @@ async def execute_investigation(
                     Investigation.status == InvestigationStatus.RUNNING.value,
                     Investigation.started_at.is_(None),
                 )
-                .values(started_at=datetime.now(UTC))
+                .values(
+                    started_at=datetime.now(UTC),
+                    heartbeat_at=datetime.now(UTC),
+                    attempts=Investigation.attempts + 1,
+                )
                 .returning(
                     Investigation.workspace_id,
                     Investigation.question,
                     Investigation.source_types,
+                    Investigation.strategy,
+                    Investigation.checkpoint,
+                    Investigation.attempts,
                 )
             )
         ).one_or_none()
         await session.commit()
     if claimed is None:
         return RunOutcome.SKIPPED
+    if claimed.checkpoint:
+        logger.info(
+            "Resuming investigation %s from %s (attempt %s)",
+            investigation_id,
+            claimed.checkpoint.get("state", {}).get("stage"),
+            claimed.attempts,
+        )
+
+    async def save_checkpoint(checkpoint: Checkpoint) -> None:
+        async with sessionmaker() as session:
+            await session.execute(
+                update(Investigation)
+                .where(
+                    Investigation.id == investigation_id,
+                    Investigation.status == InvestigationStatus.RUNNING.value,
+                )
+                .values(checkpoint=checkpoint, heartbeat_at=datetime.now(UTC))
+            )
+            await session.commit()
 
     try:
         result = await run_investigation(
@@ -129,6 +180,9 @@ async def execute_investigation(
             question=claimed.question,
             source_types=[SourceType(s) for s in claimed.source_types or []] or None,
             telemetry_http=telemetry_http,
+            strategy=claimed.strategy,
+            checkpoint=claimed.checkpoint,
+            on_checkpoint=save_checkpoint,
         )
     except TimeoutError:
         await _finish(
@@ -146,31 +200,62 @@ async def execute_investigation(
     return RunOutcome.COMPLETED
 
 
-async def fail_abandoned_investigations(
+@dataclass
+class Recovery:
+    # Released and to be queued again: they resume from their checkpoint
+    resumed: list[uuid.UUID] = field(default_factory=list)
+    # Out of attempts: marked failed
+    failed: int = 0
+
+
+async def recover_abandoned_investigations(
     sessionmaker: async_sessionmaker[AsyncSession], settings: Settings, now: datetime
-) -> int:
-    """Investigations still "running" long after their timeout belong to a worker that died."""
+) -> Recovery:
+    """Investigations still "running" with no sign of life for 3× the timeout belong to a
+    worker that died (or a task that was lost before any worker got it). Those with attempts
+    left are released for another run; the caller queues them. The rest are failed.
+
+    Each row is changed with a conditional UPDATE, so two schedulers running this at once
+    can't both release (or fail) the same investigation."""
     cutoff = now - timedelta(seconds=settings.agent_timeout_seconds * 3)
+    last_seen = func.coalesce(Investigation.heartbeat_at, Investigation.created_at)
+    stale = (
+        Investigation.status == InvestigationStatus.RUNNING.value,
+        last_seen < cutoff,
+    )
+    recovery = Recovery()
     async with sessionmaker() as session:
-        rows = (
+        recovery.resumed = list(
+            (
+                await session.scalars(
+                    update(Investigation)
+                    .where(*stale, Investigation.attempts < settings.agent_max_attempts)
+                    .values(started_at=None, heartbeat_at=now)
+                    .returning(Investigation.id)
+                )
+            ).all()
+        )
+        failed = (
             await session.scalars(
                 update(Investigation)
-                .where(
-                    Investigation.status == InvestigationStatus.RUNNING.value,
-                    Investigation.created_at < cutoff,
-                )
+                .where(*stale, Investigation.attempts >= settings.agent_max_attempts)
                 .values(
                     status=InvestigationStatus.FAILED.value,
-                    error="The worker running this investigation stopped",
+                    error="The worker running this investigation stopped, and it ran out of "
+                    "attempts",
                     completed_at=now,
+                    checkpoint=None,
                 )
                 .returning(Investigation.id)
             )
         ).all()
-        for investigation_id in rows:
+        for investigation_id in failed:
             await _record_on_incident(session, investigation_id, "investigation_failed")
+        for investigation_id in recovery.resumed:
+            await _record_on_incident(session, investigation_id, "investigation_resumed")
         await session.commit()
-    return len(rows)
+    recovery.failed = len(failed)
+    return recovery
 
 
 async def mark_unrunnable(

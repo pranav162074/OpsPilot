@@ -1,14 +1,19 @@
+import asyncio
+import hashlib
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Body, Query, Request, status
+from fastapi import APIRouter, Body, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select, update
 
-from opspilot.api.deps import Responder, SessionDep, SettingsDep, Viewer
+from opspilot.api.deps import RateLimiterDep, Responder, SessionDep, SettingsDep, Viewer, enforce
+from opspilot.api.documents import enqueue_document
 from opspilot.api.errors import ApiError
+from opspilot.incidents.postmortem import draft_postmortem, with_footnotes
 from opspilot.incidents.service import (
     AlertInput,
     ingest_alert,
@@ -16,13 +21,17 @@ from opspilot.incidents.service import (
     should_auto_investigate,
 )
 from opspilot.models import (
+    Document,
     Incident,
     IncidentEvent,
     IncidentStatus,
     Investigation,
     InvestigationStatus,
     Severity,
+    SourceType,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["incidents"])
 
@@ -113,9 +122,13 @@ async def _start_investigation(
         created_by_key_id=created_by,
         question=investigation_question(incident),
         status=InvestigationStatus.RUNNING.value,
+        strategy=request.app.state.settings.incident_agent_strategy,
         model=request.app.state.settings.llm_model,
         citations=[],
         trace=[],
+        hypotheses=[],
+        attempts=0,
+        budget_exhausted=False,
     )
     session.add(investigation)
     await session.flush()
@@ -192,6 +205,7 @@ class IncidentOut(BaseModel):
     acknowledged_at: datetime | None
     resolved_at: datetime | None
     investigation_id: uuid.UUID | None
+    postmortem_document_id: uuid.UUID | None
     created_at: datetime
 
 
@@ -345,3 +359,147 @@ async def investigate_incident(
     await session.commit()
     request.app.state.enqueue_investigation(investigation.id)
     return await _detail(session, incident)
+
+
+# --------------------------------------------------------------------------- postmortem --
+
+
+class PostmortemOut(BaseModel):
+    incident_id: uuid.UUID
+    draft: str | None
+    drafted_at: datetime | None
+    # Set once published: the postmortem document, searchable by future investigations
+    document_id: uuid.UUID | None
+
+
+class PostmortemEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    draft: Annotated[str, Field(min_length=1, max_length=100_000)]
+
+
+def _postmortem_out(incident: Incident) -> PostmortemOut:
+    return PostmortemOut(
+        incident_id=incident.id,
+        draft=incident.postmortem_draft,
+        drafted_at=incident.postmortem_drafted_at,
+        document_id=incident.postmortem_document_id,
+    )
+
+
+@router.get("/incidents/{incident_id}/postmortem")
+async def get_postmortem(
+    incident_id: uuid.UUID, principal: Viewer, session: SessionDep
+) -> PostmortemOut:
+    return _postmortem_out(await _load(session, principal.workspace.id, incident_id))
+
+
+@router.post("/incidents/{incident_id}/postmortem")
+async def draft_incident_postmortem(
+    incident_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    principal: Responder,
+    session: SessionDep,
+    settings: SettingsDep,
+    limiter: RateLimiterDep,
+) -> PostmortemOut:
+    """Has the agent draft a postmortem from the incident, its timeline and what the
+    investigation found. Drafting again replaces the draft (a published one stays)."""
+    llm = request.app.state.llm
+    if llm is None:
+        raise ApiError(
+            503, "agent_unavailable", "Drafting needs a language model; set GEMINI_API_KEY"
+        )
+    incident = await _load(session, principal.workspace.id, incident_id)
+    if incident.postmortem_document_id is not None:
+        raise ApiError(409, "already_published", "This incident's postmortem is published")
+    enforce(
+        await limiter.hit(
+            f"investigations:{principal.workspace.id}", settings.investigations_per_hour, 3600
+        ),
+        response,
+    )
+    try:
+        async with asyncio.timeout(settings.agent_timeout_seconds):
+            draft, usage = await draft_postmortem(llm, session, incident)
+    except TimeoutError as exc:
+        raise ApiError(504, "agent_timeout", "Drafting took too long") from exc
+    except Exception as exc:
+        logger.exception("Drafting the postmortem of incident %s failed", incident_id)
+        raise ApiError(502, "agent_failed", "The language model call failed") from exc
+    incident.postmortem_draft = draft
+    incident.postmortem_drafted_at = datetime.now(UTC)
+    session.add(
+        IncidentEvent(
+            incident_id=incident.id,
+            type="postmortem_drafted",
+            data={"by": principal.api_key.name, **usage},
+        )
+    )
+    await session.commit()
+    return _postmortem_out(incident)
+
+
+@router.put("/incidents/{incident_id}/postmortem")
+async def edit_postmortem(
+    incident_id: uuid.UUID, body: PostmortemEdit, principal: Responder, session: SessionDep
+) -> PostmortemOut:
+    """Saves a person's edits to the draft (filling in the TODOs)."""
+    incident = await _load(session, principal.workspace.id, incident_id)
+    if incident.postmortem_document_id is not None:
+        raise ApiError(409, "already_published", "This incident's postmortem is published")
+    incident.postmortem_draft = body.draft
+    await session.commit()
+    return _postmortem_out(incident)
+
+
+@router.post("/incidents/{incident_id}/postmortem/publish", status_code=status.HTTP_201_CREATED)
+async def publish_postmortem(
+    incident_id: uuid.UUID, request: Request, principal: Responder, session: SessionDep
+) -> PostmortemOut:
+    """Turns the draft into a postmortem document, indexed like any upload, so the next
+    investigation of a similar incident can find it. Only for resolved incidents."""
+    incident = await _load(session, principal.workspace.id, incident_id)
+    if incident.postmortem_document_id is not None:
+        raise ApiError(409, "already_published", "This incident's postmortem is published")
+    if not incident.postmortem_draft:
+        raise ApiError(409, "no_draft", "Draft the postmortem first")
+    if incident.status != IncidentStatus.RESOLVED.value:
+        raise ApiError(409, "invalid_state", "Resolve the incident before publishing")
+    citations: list[dict[str, Any]] = []
+    if incident.investigation_id:
+        investigation = await session.get(Investigation, incident.investigation_id)
+        citations = investigation.citations if investigation else []
+    content = with_footnotes(incident.postmortem_draft, citations)
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    if await session.scalar(
+        select(Document.id).where(
+            Document.workspace_id == incident.workspace_id, Document.content_hash == content_hash
+        )
+    ):
+        raise ApiError(409, "duplicate_document", "A document with this content already exists")
+    document = Document(
+        workspace_id=incident.workspace_id,
+        title=f"Postmortem: {incident.title}"[:200],
+        filename=f"postmortem-{incident.id}.md",
+        source_type=SourceType.POSTMORTEM.value,
+        media_type="text/markdown",
+        content=content,
+        content_hash=content_hash,
+        size_bytes=len(content.encode()),
+        uploaded_by_key_id=principal.api_key.id,
+        updated_at=datetime.now(UTC),
+    )
+    session.add(document)
+    await session.flush()
+    incident.postmortem_document_id = document.id
+    session.add(
+        IncidentEvent(
+            incident_id=incident.id,
+            type="postmortem_published",
+            data={"by": principal.api_key.name, "document_id": str(document.id)},
+        )
+    )
+    await session.commit()
+    await enqueue_document(request, document.id)
+    return _postmortem_out(incident)

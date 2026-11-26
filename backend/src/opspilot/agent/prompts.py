@@ -49,3 +49,97 @@ Keep citing every statement as [c:<id>]."""
 
 STEP_LIMIT_PROMPT = """You have used all your searches. Answer now, using only what you have
 already retrieved, and say what remains unknown."""
+
+# ---------------------------------------------------------------- the "plan" strategy --
+# Each stage asks for JSON, so the next stage can act on it without parsing prose.
+
+PLAN_PROMPT = """{system}
+
+You are starting an investigation. Do not answer yet: plan what evidence to collect first.
+All the steps you list run at the same time, so list everything worth knowing up front
+(at most {max_steps}): the runbook for this symptom, the metrics and logs that confirm it,
+and what changed recently.
+
+Tools you can use:
+{tools}
+
+Reply with JSON only:
+{{"steps": [{{"tool": "<tool name>", "args": {{...}}, "why": "<one line>"}}]}}
+"""
+
+HYPOTHESES_PROMPT = """Question:
+{question}
+
+Evidence collected so far (each item starts with its id, [c:<id>]):
+{evidence}
+
+List at most {max_hypotheses} possible causes, most likely first. For each, cite the evidence
+that points to it, and give one tool call that would confirm or rule it out (or null if the
+evidence already settles it).
+
+Tools you can use:
+{tools}
+
+Reply with JSON only:
+{{"hypotheses": [{{"statement": "<the cause>", "likelihood": "high|medium|low",
+"evidence": ["<id>"], "check": {{"tool": "<tool name>", "args": {{...}}}}}}]}}
+"""
+
+VERIFY_PROMPT = """Question:
+{question}
+
+Hypotheses, and what checking each one returned:
+{checks}
+
+For each hypothesis decide whether the evidence supports it, refutes it, or is inconclusive.
+Reply with JSON only:
+{{"verdicts": [{{"hypothesis": <number>, "verdict": "supported|refuted|inconclusive",
+"reason": "<one line, citing [c:<id>]>"}}]}}
+"""
+
+ANSWER_PROMPT = """Question:
+{question}
+
+Evidence (each item starts with its id, [c:<id>]):
+{evidence}
+
+Hypotheses and verdicts:
+{hypotheses}
+
+Write the answer for the engineer on call:
+1. The most likely cause and how sure you are, citing the evidence as [c:<id>].
+2. What was ruled out, and why.
+3. What to do next: numbered steps, the exact commands from the runbooks.
+
+Then, if any step changes a system (restart, roll back, scale, fail over), list those steps
+in a block at the very end, so a person can approve them. Never present them as done:
+
+```actions
+[{{"title": "<short>", "command": "<exact command from the runbook, or null>",
+"risk": "low|medium|high", "rationale": "<one line>", "citations": ["<id>"]}}]
+```
+Leave the block out if nothing needs changing.
+"""
+
+BUDGET_PROMPT = """You have used this investigation's token budget. Answer now, from the
+evidence above only, and say clearly what you couldn't check."""
+
+POSTMORTEM_PROMPT = """Draft a blameless postmortem for this incident, in Markdown.
+
+Incident:
+{incident}
+
+Timeline (UTC):
+{timeline}
+
+What the investigation found:
+{investigation}
+
+Sources the investigation cited (keep their ids, [c:<id>], where you use them):
+{sources}
+
+Use exactly these sections: # <title>, ## Summary, ## Impact, ## Timeline, ## Root cause,
+## What went well, ## What went wrong, ## Action items (a checklist with "- [ ]").
+State only what the material above supports. Where something is unknown (customer impact,
+who did what), write "TODO:" and what needs filling in, instead of guessing.
+"""

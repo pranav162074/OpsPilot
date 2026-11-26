@@ -25,9 +25,9 @@ The plan OpsPilot is built against: one branch at a time, each with tests, a pul
 
 | # | Planned branch | Status | Delivered in | Still missing |
 |---|---|---|---|---|
-| 8 | `feat/telemetry-tools` | 🔨 | `feat/telemetry-tools`: Prometheus, Loki, GitHub and deploy tools for the agent (and API, MCP); encrypted tokens, SSRF protection; Kuturl, Prometheus, Alertmanager, Loki and Alloy in Compose; the incident simulator with recorded ground truth | |
-| 9 | `feat/investigation-agent` | 🟡 | #5 `feat/investigation-agent`: LangGraph agent, step limit, timeout, saved traces, background runs | plan → parallel evidence → hypotheses → verify flow, token budget, resumable runs, human approval |
-| 10 | `feat/incident-lifecycle` | 🟡 | #6 `feat/incidents`: open → acknowledged → resolved, Alertmanager webhook, automatic investigations, timeline | Draft postmortems |
+| 8 | `feat/telemetry-tools` | ✅ | #8 `feat/telemetry-tools`: Prometheus, Loki, GitHub and deploy tools for the agent (and API, MCP); encrypted tokens, SSRF protection; Kuturl, Prometheus, Alertmanager, Loki and Alloy in Compose; the incident simulator with recorded ground truth | |
+| 9 | `feat/investigation-agent` | 🔨 | #5 `feat/investigation-agent`: LangGraph agent, step limit, timeout, saved traces, background runs; `feat/agent-v2`: plan → parallel evidence → hypotheses → verify flow, token budget, resumable runs, human approval of proposed actions (signed actions webhook) | |
+| 10 | `feat/incident-lifecycle` | 🔨 | #6 `feat/incidents`: open → acknowledged → resolved, Alertmanager webhook, automatic investigations, timeline; `feat/agent-v2`: drafted, edited and published postmortems | |
 | 11 | `feat/mcp-server` | ✅ | #7 `feat/mcp-server` | |
 
 ## Phase 4: Production-grade (resume checkpoint 3)
@@ -43,8 +43,8 @@ The plan OpsPilot is built against: one branch at a time, each with tests, a pul
 
 ## Next, in order
 
-1. **#8 `feat/telemetry-tools`.** The agent needs real metrics, logs and deploys to investigate, and Kuturl plus the incident simulator give staged incidents with known causes to measure it against.
-2. **#9 `feat/agent-v2`.** The rest of the planned agent: the plan → evidence → hypotheses → verify flow, token budget, resumable runs, human approval before actions, and draft postmortems (#10's gap).
+1. ✅ **#8 `feat/telemetry-tools`.** The agent needs real metrics, logs and deploys to investigate, and Kuturl plus the incident simulator give staged incidents with known causes to measure it against.
+2. 🔨 **#9 `feat/agent-v2`.** The rest of the planned agent: the plan → evidence → hypotheses → verify flow, token budget, resumable runs, human approval before actions, and draft postmortems (#10's gap).
 3. **`feat/answer-quality`.** The rest of #5–#7: re-ranker, CI evaluation gate, SSE streaming, prompt-injection defences, cost tracking, faithfulness evaluation.
 4. **`feat/sources-storage`.** The rest of #3–#4: GitHub connector, S3/MinIO storage, dead-letter queue, code chunking.
 5. Then #12 → #17 as planned.

@@ -92,7 +92,13 @@ def _investigation_brief(row: dict[str, Any], include_trace: bool = False) -> di
             for c in row["citations"]
         ],
         "error": row["error"],
+        "strategy": row.get("strategy"),
     }
+    if row.get("hypotheses"):
+        brief["hypotheses"] = [
+            {"statement": h["statement"], "verdict": h["verdict"], "reason": h["reason"]}
+            for h in row["hypotheses"]
+        ]
     if include_trace:
         brief["trace"] = row.get("trace", [])
         brief["usage"] = row["usage"]
@@ -222,14 +228,24 @@ def build_server(api_for: ApiFactory, *, agent_timeout_seconds: float = 90.0) ->
         source_types: Annotated[
             list[SourceType] | None, Field(description="Only search these kinds of document")
         ] = None,
+        strategy: Annotated[
+            Literal["react", "plan"] | None,
+            Field(
+                description="'react' for a quick question; 'plan' to diagnose a problem: "
+                "gathers evidence in parallel, then forms and checks hypotheses"
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """Run OpsPilot's investigation agent: it searches the documents in several steps,
         writes an answer citing the passages it used, and has the answer checked against
         those sources. Slower than search_docs (up to a minute and a half); use it when the
-        answer needs several documents put together. Needs a responder key."""
+        answer needs several documents put together. Changes it suggests making are only
+        proposals: see list_pending_actions. Needs a responder key."""
         body: dict[str, Any] = {"question": question}
         if source_types:
             body["source_types"] = source_types
+        if strategy:
+            body["strategy"] = strategy
         call = api_for(ctx).call(
             "POST",
             "/v1/investigations",
@@ -252,6 +268,24 @@ def build_server(api_for: ApiFactory, *, agent_timeout_seconds: float = 90.0) ->
             "investigation_id": investigation["id"] if investigation else None,
             "status": investigation["status"] if investigation else None,
         }
+
+    @server.tool(annotations=READ_ONLY)
+    async def list_pending_actions(ctx: Context) -> list[dict[str, Any]]:
+        """Changes investigations have proposed (restarts, rollbacks) that are waiting for a
+        person to approve or reject them in OpsPilot. You can't approve them: tell the user
+        what's waiting and why, with the citations."""
+        rows = await api_for(ctx).call("GET", "/v1/actions", params={"status": "proposed"})
+        return [
+            {
+                "id": a["id"],
+                "investigation_id": a["investigation_id"],
+                "title": a["title"],
+                "command": a["command"],
+                "risk": a["risk"],
+                "rationale": a["rationale"],
+            }
+            for a in rows
+        ]
 
     @server.tool(annotations=READ_ONLY)
     async def get_investigation(

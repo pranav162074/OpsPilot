@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from opspilot import __version__
 from opspilot.agent.llm import build_chat_model
 from opspilot.api import (
+    actions,
     api_keys,
     documents,
     health,
@@ -78,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(investigations.router)
     app.include_router(incidents.router)
     app.include_router(telemetry.router)
+    app.include_router(actions.router)
     if settings.mcp_enabled:
         # The same tools for AI assistants, at /mcp (see opspilot/mcp_server)
         mcp = McpEndpoint(app, settings)
