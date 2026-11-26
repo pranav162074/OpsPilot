@@ -20,10 +20,11 @@ from sqlalchemy.pool import NullPool
 
 from opspilot.agent.llm import build_chat_model
 from opspilot.agent.runner import (
+    Recovery,
     RunOutcome,
     execute_investigation,
-    fail_abandoned_investigations,
     mark_unrunnable,
+    recover_abandoned_investigations,
 )
 from opspilot.config import Settings, get_settings
 from opspilot.embeddings import EmbeddingUnavailable, build_embedder
@@ -41,7 +42,7 @@ logger = logging.getLogger(__name__)
 INGEST_TASK = "opspilot.ingest_document"
 REQUEUE_TASK = "opspilot.requeue_stuck_documents"
 INVESTIGATION_TASK = "opspilot.run_investigation"
-ABANDONED_TASK = "opspilot.fail_abandoned_investigations"
+ABANDONED_TASK = "opspilot.recover_abandoned_investigations"
 
 celery_app = Celery("opspilot", broker=get_settings().celery_broker_url)
 celery_app.conf.update(
@@ -59,7 +60,7 @@ celery_app.conf.update(
     task_publish_retry_policy={"max_retries": 2, "interval_start": 0.1, "interval_step": 0.2},
     beat_schedule={
         "requeue-stuck-documents": {"task": REQUEUE_TASK, "schedule": 60.0},
-        "fail-abandoned-investigations": {"task": ABANDONED_TASK, "schedule": 300.0},
+        "recover-abandoned-investigations": {"task": ABANDONED_TASK, "schedule": 120.0},
     },
 )
 
@@ -183,11 +184,20 @@ def enqueue_investigation(investigation_id: uuid.UUID) -> None:
 
 
 @celery_app.task(name=ABANDONED_TASK)
-def fail_abandoned_investigations_task() -> int:
-    async def job(sessionmaker: async_sessionmaker[AsyncSession], settings: Settings) -> int:
-        return await fail_abandoned_investigations(sessionmaker, settings, datetime.now(UTC))
+def recover_abandoned_investigations_task() -> int:
+    """Re-queues investigations whose worker died (they resume from their checkpoint), and
+    fails the ones out of attempts."""
 
-    count = _run(job)
-    if count:
-        logger.warning("Marked %s abandoned investigations as failed", count)
-    return count
+    async def job(sessionmaker: async_sessionmaker[AsyncSession], settings: Settings) -> Recovery:
+        return await recover_abandoned_investigations(sessionmaker, settings, datetime.now(UTC))
+
+    recovery = _run(job)
+    for investigation_id in recovery.resumed:
+        enqueue_investigation(investigation_id)
+    if recovery.resumed or recovery.failed:
+        logger.warning(
+            "Abandoned investigations: %s resumed, %s failed",
+            len(recovery.resumed),
+            recovery.failed,
+        )
+    return len(recovery.resumed) + recovery.failed

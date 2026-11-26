@@ -19,7 +19,7 @@ from mcp_types import CallToolResult, TextContent
 from opspilot.ingestion.service import Outcome
 from opspilot.mcp_server import server as mcp_server_module
 from tests.conftest import auth, upload
-from tests.fakes import ScriptedChatModel, answer_citing, call_tool, reply
+from tests.fakes import ScriptedChatModel, answer_citing, call_tool, reply, reply_using
 
 RUNBOOK = """# Payments API
 
@@ -123,6 +123,7 @@ async def test_lists_the_tools_with_safety_hints_and_the_triage_prompt(
         "investigate",
         "investigate_incident",
         "get_investigation",
+        "list_pending_actions",
         "query_metrics",
         "list_metric_names",
         "search_logs",
@@ -133,6 +134,7 @@ async def test_lists_the_tools_with_safety_hints_and_the_triage_prompt(
         "list_incidents",
         "get_incident",
         "get_investigation",
+        "list_pending_actions",
         "query_metrics",
         "search_logs",
         "recent_changes",
@@ -281,6 +283,49 @@ async def test_investigate_runs_the_agent_and_returns_citations(
     assert fetched["id"] == result["id"]
     assert fetched["usage"]["llm_calls"] == 3
     assert any(step.get("name") == "search_knowledge_base" for step in fetched["trace"])
+
+
+async def test_plan_investigations_and_their_proposed_actions_over_mcp(
+    app: FastAPI, workspace: tuple[str, str]
+) -> None:
+    key, _ = workspace
+    actions = [
+        {
+            "title": "Kill the long transaction",
+            "command": "SELECT pg_terminate_backend(42)",
+            "risk": "high",
+            "rationale": "Holding the pool",
+        }
+    ]
+    app.state.llm = ScriptedChatModel(
+        script=[
+            reply('{"steps": [{"tool": "search_knowledge_base", "args": {"query": "pool"}}]}'),
+            reply(
+                '{"hypotheses": [{"statement": "Long transactions", "likelihood": "high",'
+                ' "evidence": [], "check": null}]}'
+            ),
+            reply('{"verdicts": [{"hypothesis": 1, "verdict": "supported", "reason": "runbook"}]}'),
+            reply_using(
+                lambda ids: (
+                    f"Long transactions [c:{ids[0]}].\n```actions\n{json.dumps(actions)}\n```"
+                )
+            ),
+            reply("SUPPORTED"),
+        ]
+    )
+    async with connect(app, key) as mcp:
+        result = data(
+            await mcp.call_tool(
+                "investigate", {"question": "ERR_POOL_TIMEOUT. Why?", "strategy": "plan"}
+            )
+        )
+        pending = data(await mcp.call_tool("list_pending_actions", {}))
+
+    assert result["strategy"] == "plan"
+    assert result["hypotheses"] == [
+        {"statement": "Long transactions", "verdict": "supported", "reason": "runbook"}
+    ]
+    assert [(a["title"], a["risk"]) for a in pending] == [("Kill the long transaction", "high")]
 
 
 async def test_investigate_without_a_model_explains_why(

@@ -62,6 +62,22 @@ class Settings(BaseSettings):
     # The reviewer can send a draft back for one revision
     agent_reflection: bool = True
     agent_timeout_seconds: float = 90.0
+    # How the agent works. "react": reason → call a tool → repeat (quick questions).
+    # "plan": plan the evidence → gather it in parallel → hypotheses → verify each → answer
+    # (incidents). Either can be chosen per investigation.
+    agent_strategy: Literal["react", "plan"] = "react"
+    incident_agent_strategy: Literal["react", "plan"] = "plan"
+    # Input + output tokens one run may spend. Past it, the agent stops gathering and answers
+    # with what it has. 0 = no limit.
+    agent_token_budget: int = 60_000
+    # "plan": tools run at once per stage, each with its own time limit
+    agent_max_parallel_tools: int = 6
+    agent_tool_timeout_seconds: float = 20.0
+    agent_max_hypotheses: int = 3
+    # A run whose worker died is resumed from its last checkpoint, this many times in all
+    agent_max_attempts: int = 2
+    # Approved actions are sent to the workspace's "actions" webhook with this time limit
+    action_webhook_timeout_seconds: float = 10.0
     # Serve the MCP tools at /mcp, for AI assistants such as Claude and Cursor
     mcp_enabled: bool = True
     investigations_per_hour: int = 30

@@ -96,3 +96,22 @@ def reply(text: str) -> Step:
 
 def fail(_: list[BaseMessage]) -> AIMessage:
     raise RuntimeError("The model API returned 500")
+
+
+def evidence_ids(messages: list[BaseMessage]) -> list[str]:
+    """Ids shown to the model anywhere in its prompt: the "plan" strategy puts the evidence in
+    the prompt text instead of in tool messages."""
+    ids: list[str] = []
+    for message in messages:
+        for found in re.findall(r"\[c:([0-9a-f-]{36})\]", str(message.content)):
+            if found not in ids:
+                ids.append(found)
+    return ids
+
+
+def reply_using(make: Callable[[list[str]], str]) -> Step:
+    """Replies with text built from the evidence ids in the prompt (e.g. JSON citing them)."""
+    return lambda messages: AIMessage(
+        content=make(evidence_ids(messages)),
+        usage_metadata=USAGE,  # type: ignore[arg-type]
+    )

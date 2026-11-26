@@ -179,6 +179,68 @@ agent --tool calls--> tools --> agent          ReAct: reason, act, observe, repe
 
 **Tests** run the real graph with a scripted chat model that plays back prepared replies (tool calls, drafts, reviewer verdicts). They cover the ReAct loop, revision, the step limit, unknown tools, made-up citations, workspace isolation, timeouts and failures, with no API calls. Tests always use the offline embedder and no real model, whatever `.env` says.
 
+### Two strategies: `react` and `plan`
+
+`react` (above) decides one tool call at a time: right for a quick question. Incidents are investigated with `plan`, which works the way an engineer would ([`agent/planner.py`](backend/src/opspilot/agent/planner.py)):
+
+```
+plan --> gather --> hypothesize --> verify --> answer --> review --> done
+(what to   (every planned   (up to 3 causes,   (one check per      (cites the         +--unsupported--> answer
+ look at)   tool at once)    with evidence)     cause, at once)     evidence)
+```
+
+1. **Plan:** the model lists everything worth knowing up front (the runbook for this symptom, the metrics and logs that confirm it, recent deploys). Unknown tools are dropped; an unusable plan still gets a runbook search.
+2. **Gather:** all planned tool calls run concurrently, each with its own time limit (`AGENT_TOOL_TIMEOUT_SECONDS`). A tool that fails or times out is reported as evidence ("Loki didn't answer"), not raised.
+3. **Hypothesize:** possible causes, most likely first, each citing its evidence and naming one tool call that would confirm or rule it out.
+4. **Verify:** those checks run concurrently, then the model rules on each cause: `supported`, `refuted` or `inconclusive`. They're stored on the investigation (`hypotheses`), supported first.
+5. **Answer, then review:** the answer names the likely cause, what was ruled out and the next steps, citing evidence; the reviewer checks it against the cited sources as in `react`.
+
+Every stage asks for JSON and the parsing is defensive: models wrap JSON in prose and code fences, invent tools and misspell verdicts, and none of that breaks a run. Choose per request with `"strategy": "react" | "plan"`, or set the defaults with `AGENT_STRATEGY` (default `react`) and `INCIDENT_AGENT_STRATEGY` (default `plan`).
+
+### Token budget
+
+`AGENT_TOKEN_BUDGET` (default 60,000 input + output tokens) caps what one run may spend. It's checked before every model call: past it, `plan` skips the remaining gathering and reasoning and answers with the evidence it has, and `react` stops calling tools. Either way the answer is told to say what couldn't be checked, the review is skipped, and the investigation is marked `budget_exhausted: true`.
+
+### Resumable runs
+
+A `plan` run stores its state after every stage: the stage reached, the evidence, the hypotheses, every passage it may cite, and the trace so far. That write is also its heartbeat. Every two minutes the scheduler (`celery beat`) looks for running investigations that have been silent for 3× the timeout:
+
+- with attempts left (`AGENT_MAX_ATTEMPTS`, default 2), the claim is released and the task queued again. The next worker carries on from the last finished stage, so a crash during the answer costs one model call, not six, and the answer can still cite what the first run found. The trace and token counts cover both runs, and `attempts` shows it was resumed;
+- the rest are marked failed. A task lost before any worker picked it up is resumed the same way.
+
+Both changes are conditional UPDATEs, so two schedulers can't release or fail the same run twice, and the claim itself stays the single UPDATE that makes a duplicate delivery a no-op.
+
+### Actions need a person's approval
+
+The agent never changes anything. When its answer involves a change (roll back, restart, fail over), it lists it in a separate block, which OpsPilot stores as a **proposed action**: title, the exact command from the runbook, risk, rationale, and citations (only to evidence it actually saw).
+
+| Endpoint | Who |
+|---|---|
+| `GET /v1/actions?status=proposed` (the approval queue), `GET /v1/investigations/{id}/actions` | viewer |
+| `POST /v1/actions/{id}/approve`, `/reject` (with an optional `note`), `/retry` | responder |
+
+Approval is one conditional UPDATE (five people clicking at once: one approval, four `409`s), recorded with who approved it and why, and on the incident's timeline. It's committed *before* anything is sent. Then:
+
+- with no actions webhook, the action is `approved`, for the engineer to carry out;
+- with one (`PUT /v1/integrations/actions` with the URL and a signing secret as the token), it's POSTed there, and becomes `executed` or `failed` (retry with `/retry`). The request is signed like Stripe's and GitHub's webhooks:
+
+```
+X-OpsPilot-Timestamp: 1764147600
+X-OpsPilot-Signature: sha256=<hex HMAC-SHA256 of "<timestamp>.<raw body>" with the secret>
+```
+
+The timestamp is signed too, so a receiver can refuse replays. The webhook URL gets the same SSRF checks as telemetry URLs, and `POST /v1/integrations/actions/check` sends a signed `{"type": "ping"}`. Over MCP, assistants can list pending actions but not approve them.
+
+### Postmortem drafts
+
+| Endpoint | Who |
+|---|---|
+| `POST /v1/incidents/{id}/postmortem` (draft it), `PUT` (save edits) | responder |
+| `GET /v1/incidents/{id}/postmortem` | viewer |
+| `POST /v1/incidents/{id}/postmortem/publish` | responder, resolved incidents only |
+
+The draft is written from the incident, its timeline, the investigation's answer, hypotheses and actions, in fixed sections (summary, impact, timeline, root cause, what went well and wrong, action items). Anything the material doesn't support is marked `TODO:` for a person to fill in, and citations of anything the investigation didn't cite are removed. Publishing turns the `[c:<id>]` markers into footnotes naming the source and stores it as a `postmortem` document, indexed like an upload, so the next investigation of a similar incident finds it.
+
 ## Incidents and alerts
 
 Point a monitoring tool's webhook at `POST /v1/alerts` with a responder API key as the bearer token. It accepts a simple format, or Prometheus Alertmanager's webhook format as is:

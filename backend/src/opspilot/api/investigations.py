@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,6 +23,8 @@ class InvestigationRequest(BaseModel):
     source_types: list[SourceType] | None = None
     # Return at once and let the worker run it, instead of waiting for the answer
     background: bool = False
+    # "react" or "plan" (see Settings.agent_strategy); the server's default if left out
+    strategy: Literal["react", "plan"] | None = None
 
 
 class CitationOut(BaseModel):
@@ -43,16 +45,30 @@ class Usage(BaseModel):
     latency_ms: float | None
 
 
+class Hypothesis(BaseModel):
+    statement: str
+    likelihood: str
+    evidence: list[str]
+    check: dict[str, Any] | None
+    verdict: str | None
+    reason: str | None
+
+
 class InvestigationOut(BaseModel):
     id: uuid.UUID
     question: str
     status: InvestigationStatus
+    strategy: str
     answer: str | None
     citations: list[CitationOut]
     invalid_citations: int
     error: str | None
     model: str | None
     usage: Usage
+    # The run hit the token budget and answered with the evidence it had by then
+    budget_exhausted: bool
+    # How many times a runner picked it up (more than 1: it was resumed after a crash)
+    attempts: int
     created_at: datetime
     completed_at: datetime | None
 
@@ -60,6 +76,10 @@ class InvestigationOut(BaseModel):
 class InvestigationDetail(InvestigationOut):
     # Every model call and tool call, in order: how the agent reached its answer
     trace: list[dict[str, Any]]
+    # "plan" runs: each cause considered, how it was checked, and the verdict
+    hypotheses: list[Hypothesis]
+    # Where a running "plan" investigation has got to
+    stage: str | None
 
 
 def _fields(row: Investigation) -> dict[str, Any]:
@@ -67,6 +87,7 @@ def _fields(row: Investigation) -> dict[str, Any]:
         "id": row.id,
         "question": row.question,
         "status": InvestigationStatus(row.status),
+        "strategy": row.strategy,
         "answer": row.answer,
         "citations": row.citations,
         "invalid_citations": row.invalid_citations,
@@ -79,6 +100,8 @@ def _fields(row: Investigation) -> dict[str, Any]:
             output_tokens=row.output_tokens,
             latency_ms=row.latency_ms,
         ),
+        "budget_exhausted": row.budget_exhausted,
+        "attempts": row.attempts,
         "created_at": row.created_at,
         "completed_at": row.completed_at,
     }
@@ -89,7 +112,11 @@ def _out(row: Investigation) -> InvestigationOut:
 
 
 def _detail(row: Investigation) -> InvestigationDetail:
-    return InvestigationDetail(**_fields(row), trace=row.trace)
+    hypotheses = [
+        Hypothesis(**{k: h.get(k) for k in Hypothesis.model_fields}) for h in row.hypotheses or []
+    ]
+    stage = (row.checkpoint or {}).get("state", {}).get("stage") if row.checkpoint else None
+    return InvestigationDetail(**_fields(row), trace=row.trace, hypotheses=hypotheses, stage=stage)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -126,9 +153,13 @@ async def create_investigation(
         question=body.question,
         source_types=[s.value for s in body.source_types] if body.source_types else None,
         status=InvestigationStatus.RUNNING.value,
+        strategy=body.strategy or settings.agent_strategy,
         model=settings.llm_model,
         citations=[],
         trace=[],
+        hypotheses=[],
+        attempts=0,
+        budget_exhausted=False,
     )
     session.add(row)
     await session.commit()

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -8,13 +9,17 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy import func, select, update
 
-from opspilot.agent.runner import RunOutcome, execute_investigation, fail_abandoned_investigations
+from opspilot.agent.runner import (
+    RunOutcome,
+    execute_investigation,
+    recover_abandoned_investigations,
+)
 from opspilot.config import Settings
 from opspilot.incidents.service import AlertInput, fingerprint_of
 from opspilot.ingestion.service import Outcome
 from opspilot.models import Incident, Investigation, Severity
 from tests.conftest import auth, upload
-from tests.fakes import ScriptedChatModel, answer_citing, call_tool, fail, reply
+from tests.fakes import ScriptedChatModel, fail, reply, reply_using
 
 RUNBOOK = """# Payments API
 
@@ -213,10 +218,29 @@ async def test_serious_incidents_get_an_investigation_in_the_background(
     _, key = await create_workspace()
     doc = (await upload(client, key, RUNBOOK, "payments.md")).json()
     await ingest(doc["id"])
+    # Incidents use the "plan" strategy: plan, gather, hypothesize, verify, answer, review
     app.state.llm = ScriptedChatModel(
         script=[
-            call_tool("search_knowledge_base", query="ERR_POOL_TIMEOUT"),
-            answer_citing("Check pg_stat_activity for long transactions."),
+            reply(
+                '{"steps": [{"tool": "search_knowledge_base",'
+                ' "args": {"query": "ERR_POOL_TIMEOUT"}, "why": "the runbook"}]}'
+            ),
+            reply_using(
+                lambda ids: json.dumps(
+                    {
+                        "hypotheses": [
+                            {
+                                "statement": "Long transactions exhaust the pool",
+                                "likelihood": "high",
+                                "evidence": [ids[0]],
+                                "check": None,
+                            }
+                        ]
+                    }
+                )
+            ),
+            reply('{"verdicts": [{"hypothesis": 1, "verdict": "supported", "reason": "runbook"}]}'),
+            reply_using(lambda ids: f"Check pg_stat_activity for long transactions. [c:{ids[0]}]"),
             reply("SUPPORTED"),
         ]
     )
@@ -339,20 +363,26 @@ async def test_failures_and_abandoned_runs_are_recorded_on_the_incident(
         embedder=app.state.embedder,
         query_cache=app.state.query_cache,
     )
-    # The second one's worker "died": its investigation stays running, long past the timeout
+    # The second one's worker "died" on its last attempt: it stays running, long past the
+    # timeout, with no attempts left
     async with app.state.sessionmaker() as session:
         await session.execute(
             update(Investigation)
             .where(Investigation.id == queued_investigations[1])
-            .values(created_at=datetime.now(UTC) - timedelta(hours=1))
+            .values(
+                created_at=datetime.now(UTC) - timedelta(hours=1),
+                started_at=datetime.now(UTC) - timedelta(hours=1),
+                attempts=settings.agent_max_attempts,
+            )
         )
         await session.commit()
-    abandoned = await fail_abandoned_investigations(
+    recovery = await recover_abandoned_investigations(
         app.state.sessionmaker, settings, datetime.now(UTC)
     )
 
     assert failed == RunOutcome.FAILED
-    assert abandoned == 1
+    assert recovery.failed == 1
+    assert recovery.resumed == []
     for result in (first, second):
         incident = (
             await client.get(f"/v1/incidents/{result[0]['incident_id']}", headers=auth(key))

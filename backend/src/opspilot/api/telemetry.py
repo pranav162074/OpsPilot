@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
+from opspilot.actions import WebhookUnavailable, load_webhook
+from opspilot.actions import send as send_webhook
 from opspilot.api.deps import Admin, Responder, SessionDep, SettingsDep, Viewer
 from opspilot.api.errors import ApiError
 from opspilot.models import Deploy, Integration, IntegrationKind
@@ -105,6 +107,10 @@ async def save_integration(
         options["repository"] = body.repository
     elif body.repository is not None:
         raise ApiError(422, "invalid_request", "Only GitHub integrations take a repository")
+    if kind == IntegrationKind.ACTIONS and not (body.token and body.token.get_secret_value()):
+        raise ApiError(
+            422, "token_required", "The actions webhook needs a signing secret, as the token"
+        )
 
     secret = None
     if body.token is not None and body.token.get_secret_value():
@@ -164,7 +170,21 @@ async def check_integration(
     session: SessionDep,
     settings: SettingsDep,
 ) -> CheckResult:
-    """Tries the connection with the saved URL and token."""
+    """Tries the connection with the saved URL and token. For the actions webhook, sends a
+    signed {"type": "ping"}."""
+    if kind == IntegrationKind.ACTIONS:
+        try:
+            webhook = await load_webhook(session, principal.workspace.id, settings)
+        except WebhookUnavailable as exc:
+            return CheckResult(kind=kind, ok=False, message=str(exc))
+        if webhook is None:
+            raise ApiError(404, "not_found", "That integration isn't set up")
+        sent = await send_webhook(_http(request), webhook, {"type": "ping"}, settings)
+        if not sent["ok"]:
+            return CheckResult(
+                kind=kind, ok=False, message=sent.get("error") or f"HTTP {sent['status_code']}"
+            )
+        return CheckResult(kind=kind, ok=True, message=f"Answered HTTP {sent['status_code']}")
     telemetry = await load_telemetry(session, principal.workspace.id, _http(request), settings)
     client = {
         IntegrationKind.PROMETHEUS: telemetry.prometheus,

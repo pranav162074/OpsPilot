@@ -30,7 +30,7 @@ def _not_found() -> ApiError:
     return ApiError(404, "not_found", "Document not found")
 
 
-async def _enqueue(request: Request, document_id: uuid.UUID) -> None:
+async def enqueue_document(request: Request, document_id: uuid.UUID) -> None:
     try:
         # Publishing to Celery is blocking network I/O, so it runs off the event loop
         await run_in_threadpool(request.app.state.enqueue_ingestion, document_id)
@@ -123,7 +123,7 @@ async def upload_document(
             raise error from None
         raise
 
-    await _enqueue(request, document.id)
+    await enqueue_document(request, document.id)
     return DocumentOut.model_validate(document)
 
 
@@ -228,7 +228,7 @@ async def reingest_document(
         raise ApiError(409, "ingestion_in_progress", "The document is already being indexed")
     await session.commit()
     await session.refresh(document)
-    await _enqueue(request, document.id)
+    await enqueue_document(request, document.id)
     return DocumentOut.model_validate(document)
 
 

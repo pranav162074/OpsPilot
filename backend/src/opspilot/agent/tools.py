@@ -4,6 +4,7 @@ ever see that workspace's documents, whatever it asks for."""
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
@@ -55,6 +56,34 @@ class Retrieved:
         self.sources[chunk.id] = Source(
             chunk.id, document.id, document.title, chunk.heading, chunk.content
         )
+
+    def to_json(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "chunk_id": str(s.chunk_id),
+                "document_id": str(s.document_id) if s.document_id else None,
+                "document_title": s.document_title,
+                "heading": s.heading,
+                "content": s.content,
+                "kind": s.kind,
+            }
+            for s in self.sources.values()
+        ]
+
+    @classmethod
+    def from_json(cls, data: list[dict[str, Any]]) -> "Retrieved":
+        retrieved = cls()
+        for item in data:
+            source = Source(
+                chunk_id=uuid.UUID(item["chunk_id"]),
+                document_id=uuid.UUID(item["document_id"]) if item["document_id"] else None,
+                document_title=item["document_title"],
+                heading=item["heading"],
+                content=item["content"],
+                kind=item.get("kind", "document"),
+            )
+            retrieved.sources[source.chunk_id] = source
+        return retrieved
 
     def observe(self, kind: str, title: str, heading: str, content: str) -> uuid.UUID:
         """Records a telemetry result under a fresh id, so it can be cited (and checked by the

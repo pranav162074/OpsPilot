@@ -32,6 +32,7 @@ from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 
 from opspilot.agent.prompts import (
+    BUDGET_PROMPT,
     REVIEW_PROMPT,
     REVISION_PROMPT,
     STEP_LIMIT_PROMPT,
@@ -76,6 +77,29 @@ class Trace:
                 "tool_calls": [c["name"] for c in tool_calls],
                 "text": text_of(message)[:TRACE_TEXT_LIMIT],
             }
+        )
+
+    @property
+    def tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "events": self.events,
+            "llm_calls": self.llm_calls,
+            "tool_calls": self.tool_calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "Trace":
+        return cls(
+            events=list(data.get("events", [])),
+            llm_calls=int(data.get("llm_calls", 0)),
+            tool_calls=int(data.get("tool_calls", 0)),
+            input_tokens=int(data.get("input_tokens", 0)),
+            output_tokens=int(data.get("output_tokens", 0)),
         )
 
     def tool(self, name: str, args: dict[str, Any], output: str, started: float, ok: bool) -> None:
@@ -124,6 +148,7 @@ def build_graph(
     question: str,
     max_steps: int,
     reflection: bool,
+    token_budget: int = 0,
 ) -> Any:
     by_name = {tool.name: tool for tool in tools}
     with_tools = llm.bind_tools(list(tools))
@@ -155,12 +180,17 @@ def build_graph(
             )
         return {"messages": results}
 
+    def over_budget() -> bool:
+        return token_budget > 0 and trace.tokens >= token_budget
+
     async def force_answer(state: AgentState) -> dict[str, Any]:
-        # The model wanted to keep searching; make it answer, without tools this time
+        # The model wanted to keep searching (out of steps or tokens); make it answer,
+        # without tools this time
+        prompt = HumanMessage(BUDGET_PROMPT if over_budget() else STEP_LIMIT_PROMPT)
         started = time.perf_counter()
-        response = await llm.ainvoke([system, *state["messages"], HumanMessage(STEP_LIMIT_PROMPT)])
+        response = await llm.ainvoke([system, *state["messages"], prompt])
         trace.llm("force_answer", response, started)
-        return {"messages": [HumanMessage(STEP_LIMIT_PROMPT), response]}
+        return {"messages": [prompt, response]}
 
     async def review(state: AgentState) -> dict[str, Any]:
         draft = text_of(state["messages"][-1])
@@ -183,15 +213,18 @@ def build_graph(
     def after_agent(state: AgentState) -> Literal["tools", "force_answer", "review", "__end__"]:
         last = state["messages"][-1]
         if isinstance(last, AIMessage) and last.tool_calls:
-            return "tools" if state["steps"] < max_steps else "force_answer"
-        return "review" if reflection and state["revisions"] == 0 else "__end__"
+            return "tools" if state["steps"] < max_steps and not over_budget() else "force_answer"
+        return "review" if should_review(state) else "__end__"
+
+    def should_review(state: AgentState) -> bool:
+        return reflection and state["revisions"] == 0 and not over_budget()
 
     def after_review(state: AgentState) -> Literal["agent", "__end__"]:
         # A revision request is the last message only when the reviewer rejected the draft
         return "agent" if isinstance(state["messages"][-1], HumanMessage) else "__end__"
 
     def after_force(state: AgentState) -> Literal["review", "__end__"]:
-        return "review" if reflection and state["revisions"] == 0 else "__end__"
+        return "review" if should_review(state) else "__end__"
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent)

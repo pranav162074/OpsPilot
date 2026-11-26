@@ -23,6 +23,9 @@ class IntegrationKind(enum.StrEnum):
     PROMETHEUS = "prometheus"
     LOKI = "loki"
     GITHUB = "github"
+    # Not telemetry: where approved actions are sent (a signed webhook). The agent never
+    # calls it; only a person approving an action does.
+    ACTIONS = "actions"
 
 
 class Integration(IdMixin, CreatedAtMixin, Base):
@@ -32,7 +35,7 @@ class Integration(IdMixin, CreatedAtMixin, Base):
     __tablename__ = "integrations"
     __table_args__ = (
         UniqueConstraint("workspace_id", "kind"),
-        CheckConstraint("kind IN ('prometheus', 'loki', 'github')", name="kind_valid"),
+        CheckConstraint("kind IN ('prometheus', 'loki', 'github', 'actions')", name="kind_valid"),
     )
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(
