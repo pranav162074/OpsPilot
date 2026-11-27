@@ -136,6 +136,7 @@ With the offline `hashing` embedder:
 | keyword | 0.50 | 0.50 | 0.08 |
 | vector | 0.73 | 0.83 | 0.58 |
 | hybrid | 0.77 | 0.86 | 0.58 |
+| **hybrid + re-ranker** | **1.00** | **1.00** | **1.00** |
 
 With `gemini-embedding-001` (768 dimensions):
 
@@ -145,7 +146,42 @@ With `gemini-embedding-001` (768 dimensions):
 | vector | 0.95 | 0.98 | 1.00 |
 | hybrid | 1.00 | 1.00 | 1.00 |
 
-Keyword search nails exact identifiers and misses almost every paraphrase. Hybrid keeps keyword search's perfect score on identifiers and adds vector search's recall on paraphrases. A test runs this evaluation on every CI build, so a change that makes retrieval worse fails the build.
+Keyword search nails exact identifiers and misses almost every paraphrase. Hybrid keeps keyword search's perfect score on identifiers and adds vector search's recall on paraphrases. The re-ranker then fixes the order: with even the crude offline embedder, the right document is first for every question.
+
+**Re-ranking.** Hybrid search scores the query and each passage separately, so it can't tell a passage that *answers* "the database ran out of connections" from one that merely shares its words. A cross-encoder reads the query and the passage together, which is far more precise, and far too slow for a whole corpus. So search finds candidates cheaply, and the cross-encoder re-orders the top 20 (`RERANK_CANDIDATES`). The model is `ms-marco-MiniLM-L-6-v2` (80 MB, Apache-2.0), run locally on the CPU through ONNX: free, no API, a few milliseconds per query, loaded once per process and shared.
+
+```bash
+uv sync --extra rerank      # adds fastembed (ONNX Runtime); the model downloads on first use
+RERANKER=cross-encoder      # in .env
+```
+
+Search, the agent's `search_knowledge_base` tool and the evaluation all rank through the same function. Results carry `rerank_score`; `"rerank": false` in a search request skips it; a re-ranker that fails leaves results in fusion order with `"degraded": true`.
+
+**The quality gate.** `--check` compares the scores with [`evals/thresholds.json`](backend/evals/thresholds.json) (per embedding provider) and exits 1 if any is lower:
+
+```bash
+uv run python -m opspilot.evals.retrieval --check
+```
+
+CI runs it in its own job, with the offline embedder (deterministic, no API key) and the re-ranker (its model cached between runs). A change that makes search worse fails the build, the same as a failing test.
+
+**Answer evaluation.** Retrieval being right doesn't make answers right, so a second evaluation runs the whole agent on 8 incident questions ([`evals/answer_cases.json`](backend/evals/answer_cases.json)) and scores each answer:
+
+| metric | meaning |
+|---|---|
+| grounded | cites the document that answers the question |
+| citation precision | share of its citations from that document |
+| coverage | share of the key facts (a command, a setting) it includes |
+| faithfulness | share of its claims that its cited sources support, judged by a second model call that sees only the answer and those sources |
+
+plus invalid citations, tokens, cost and latency. Unsupported claims are printed one by one, which is what makes it useful when changing a prompt.
+
+```bash
+uv run python -m opspilot.evals.answers                     # react strategy
+uv run python -m opspilot.evals.answers --strategy plan --rerank --check --json results.json
+```
+
+It needs `GEMINI_API_KEY` (the free tier covers it) and isn't in CI: model answers vary from run to run and cost quota. Its parts (the judge, the scoring) are tested with a scripted model.
 
 ## Investigations (the agent)
 
@@ -240,6 +276,43 @@ The timestamp is signed too, so a receiver can refuse replays. The webhook URL g
 | `POST /v1/incidents/{id}/postmortem/publish` | responder, resolved incidents only |
 
 The draft is written from the incident, its timeline, the investigation's answer, hypotheses and actions, in fixed sections (summary, impact, timeline, root cause, what went well and wrong, action items). Anything the material doesn't support is marked `TODO:` for a person to fill in, and citations of anything the investigation didn't cite are removed. Publishing turns the `[c:<id>]` markers into footnotes naming the source and stores it as a `postmortem` document, indexed like an upload, so the next investigation of a similar incident finds it.
+
+### Streaming
+
+`POST /v1/investigations/stream` takes the same body and answers with Server-Sent Events while the agent works:
+
+```
+event: investigation
+data: {"id":"..."}
+
+event: step
+data: {"type":"tool","name":"search_knowledge_base","args":{"query":"ERR_POOL_TIMEOUT"},"ok":true,...}
+
+: keep-alive
+
+event: done
+data: {"id":"...","status":"completed","answer":"...","citations":[...],...}
+```
+
+A `step` per model call and tool call as it finishes, a comment every `SSE_HEARTBEAT_SECONDS` so proxies keep the connection open, then `done` (the whole investigation) or `error`. The run is a task owned by the server, not by the connection: if the client disconnects it still finishes and is saved. On shutdown, streamed runs still going are stopped where they are, and the scheduler resumes them in a worker from their checkpoint.
+
+### Prompt injection
+
+Runbooks, logs and commit messages are written by people, and some of those people may be attackers: a log line can contain whatever a request put in it. So text that reaches the agent is treated as hostile, in layers ([`security/injection.py`](backend/src/opspilot/security/injection.py)):
+
+1. **Invisible text is removed** at upload: Unicode tag characters (which can spell out a whole instruction the model reads but a reviewer can't see), bidi overrides and zero-width characters.
+2. **Suspicious passages are flagged** when indexed: text that addresses an AI rather than an engineer ("ignore previous instructions", "you are now", "do not tell the user", fake role markers, image links that would carry data away). Look-alike characters are folded first, so full-width "Ｉｇｎｏｒｅ" is caught too. Flags show in search results (`flags`), and investigations count them (`flagged_sources`). Nothing is blocked: a runbook *about* prompt injection is indexed, just flagged.
+3. **Untrusted text is fenced** (spotlighting): every tool result reaches the model between `⟦untrusted⟧` markers that the system prompt says never to take instructions from, with a WARNING before flagged ones. The marker characters are replaced in the content first, so a document can't close the fence early.
+4. **What the agent proposes is checked against what it read.** A proposed action's command must appear in a source it cites (otherwise the agent made it up, or was told to), and none of its sources may be flagged. Failing either raises it to high risk, whatever the agent said, and approving it needs `"confirm_unverified": true`, with the reason shown.
+
+Detection is a heuristic and will miss things; layers 3 and 4 are what matter when it does. The tests use a poisoned runbook that tries to get a `curl | sh` approved.
+
+### Cost tracking and budgets
+
+Every investigation stores its cost (`usage.cost_usd`) at the configured list prices (`LLM_INPUT_USD_PER_MTOK`, `LLM_OUTPUT_USD_PER_MTOK`; the defaults are gemini-3.8-flash's standard rate). On the free tier nothing is billed, but the figure still shows what the traffic would cost.
+
+- `GET /v1/usage?days=30` (viewer): per day, investigations, model calls, tokens and cost; totals; month-to-date spend; how many runs saw flagged sources.
+- `PUT /v1/usage/budget` (admin) with `{"monthly_budget_usd": "20.00"}` caps the month's spend. Past it, new investigations and postmortem drafts get `402 budget_exceeded`, and alerts still open incidents but skip the automatic investigation (`investigation_skipped` on the timeline). A run already going is never cut off. `null` removes the cap.
 
 ## Incidents and alerts
 

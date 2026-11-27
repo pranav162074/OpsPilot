@@ -4,6 +4,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -18,6 +19,8 @@ from opspilot.config import Settings
 from opspilot.embeddings import Embedder
 from opspilot.embeddings.cache import QueryEmbeddingCache
 from opspilot.models import SourceType
+from opspilot.search.rerank import Reranker
+from opspilot.security.injection import command_in_sources
 from opspilot.telemetry.service import load_telemetry
 
 logger = logging.getLogger(__name__)
@@ -50,6 +53,36 @@ class InvestigationResult:
     actions: list[dict[str, Any]] = field(default_factory=list)
     budget_exhausted: bool = False
     resumed_from: str | None = None
+    # Sources it saw that look like prompt injection
+    flagged_sources: int = 0
+    cost_usd: Decimal | None = None
+    # Everything the tools showed the model (for evaluations: what the answer may rest on)
+    retrieved: Retrieved | None = None
+
+
+def cost_of(settings: Settings, input_tokens: int, output_tokens: int) -> Decimal:
+    """List-price cost of a run's tokens, to the millionth of a dollar."""
+    dollars = (
+        input_tokens * settings.llm_input_usd_per_mtok
+        + output_tokens * settings.llm_output_usd_per_mtok
+    ) / 1_000_000
+    return Decimal(str(round(dollars, 6)))
+
+
+def check_actions(actions: list[dict[str, Any]], retrieved: Retrieved) -> None:
+    """The last line against injected instructions: an action is only as trustworthy as the
+    sources behind it. Its command must appear in a source it cites (otherwise the agent made
+    it up, or was told to), and no source it cites may be flagged. Either failing raises it to
+    high risk, and approving it then needs an explicit confirmation."""
+    for action in actions:
+        cited = [retrieved.sources[uuid.UUID(c)] for c in action["citations"]]
+        command = action["command"]
+        action["verified"] = command is None or command_in_sources(
+            command, [s.content for s in cited]
+        )
+        action["flags"] = sorted({flag for s in cited for flag in s.flags})
+        if not action["verified"] or action["flags"]:
+            action["risk"] = "high"
 
 
 # What a "plan" run stores after each stage, to resume from if its worker dies
@@ -84,11 +117,14 @@ async def run_investigation(
     strategy: str = "react",
     checkpoint: Checkpoint | None = None,
     on_checkpoint: Callable[[Checkpoint], Awaitable[None]] | None = None,
+    reranker: Reranker | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> InvestigationResult:
     started = time.perf_counter()
     resume = checkpoint if strategy == "plan" and checkpoint else None
     retrieved = Retrieved.from_json(resume["sources"]) if resume else Retrieved()
     trace = Trace.from_json(resume["trace"]) if resume else Trace()
+    trace.listener = on_event
     tools = build_tools(
         sessionmaker=sessionmaker,
         settings=settings,
@@ -97,6 +133,7 @@ async def run_investigation(
         workspace_id=workspace_id,
         retrieved=retrieved,
         default_source_types=source_types,
+        reranker=reranker,
     )
     if telemetry_http is not None:
         async with sessionmaker() as session:
@@ -161,7 +198,10 @@ async def run_investigation(
     # A citation is only trusted if the tools actually showed the model that passage
     answer, invalid = _clean_citations(answer, retrieved)
     for action in actions:
-        action["citations"] = [c for c in action["citations"] if _is_known(c, retrieved)]
+        action["citations"] = [
+            c.removeprefix("c:") for c in action["citations"] if _is_known(c, retrieved)
+        ]
+    check_actions(actions, retrieved)
     citations = [
         Citation(
             chunk_id=s.chunk_id,
@@ -187,6 +227,8 @@ async def run_investigation(
                 "strategy": strategy,
                 "budget_exhausted": budget_exhausted,
                 "resumed_from": resume["state"]["stage"] if resume else None,
+                "flagged_sources": retrieved.flagged,
+                "unverified_actions": sum(1 for a in actions if not a["verified"]),
             }
         },
     )
@@ -204,6 +246,9 @@ async def run_investigation(
         actions=actions,
         budget_exhausted=budget_exhausted,
         resumed_from=resume["state"]["stage"] if resume else None,
+        flagged_sources=retrieved.flagged,
+        cost_usd=cost_of(settings, trace.input_tokens, trace.output_tokens),
+        retrieved=retrieved,
     )
 
 

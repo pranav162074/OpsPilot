@@ -30,6 +30,8 @@ from opspilot.models import (
     Severity,
     SourceType,
 )
+from opspilot.security.injection import remove_invisible
+from opspilot.usage import ensure_within_budget, over_budget
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,7 @@ async def _start_investigation(
         hypotheses=[],
         attempts=0,
         budget_exhausted=False,
+        flagged_sources=0,
     )
     session.add(investigation)
     await session.flush()
@@ -159,6 +162,7 @@ async def receive_alerts(
 
     # New, serious incidents get an investigation, run in the background by the worker
     to_enqueue: list[uuid.UUID] = []
+    spent = await over_budget(session, principal.workspace)
     if request.app.state.llm is not None:
         for outcome in outcomes:
             if outcome.action != "opened" or outcome.incident_id is None:
@@ -167,6 +171,16 @@ async def receive_alerts(
             if incident is None or not should_auto_investigate(
                 incident.severity, settings.auto_investigate_severity
             ):
+                continue
+            if spent is not None:
+                # Out of budget: the incident is still recorded, just not investigated
+                session.add(
+                    IncidentEvent(
+                        incident_id=incident.id,
+                        type="investigation_skipped",
+                        data={"reason": "budget_exceeded", "month_to_date_usd": str(spent)},
+                    )
+                )
                 continue
             investigation = await _start_investigation(
                 request, session, incident, principal.api_key.id
@@ -355,6 +369,7 @@ async def investigate_incident(
             503, "agent_unavailable", "Investigations need a language model; set GEMINI_API_KEY"
         )
     incident = await _load(session, principal.workspace.id, incident_id)
+    await ensure_within_budget(session, principal.workspace)
     investigation = await _start_investigation(request, session, incident, principal.api_key.id)
     await session.commit()
     request.app.state.enqueue_investigation(investigation.id)
@@ -413,6 +428,7 @@ async def draft_incident_postmortem(
     incident = await _load(session, principal.workspace.id, incident_id)
     if incident.postmortem_document_id is not None:
         raise ApiError(409, "already_published", "This incident's postmortem is published")
+    await ensure_within_budget(session, principal.workspace)
     enforce(
         await limiter.hit(
             f"investigations:{principal.workspace.id}", settings.investigations_per_hour, 3600
@@ -470,7 +486,7 @@ async def publish_postmortem(
     if incident.investigation_id:
         investigation = await session.get(Investigation, incident.investigation_id)
         citations = investigation.citations if investigation else []
-    content = with_footnotes(incident.postmortem_draft, citations)
+    content = remove_invisible(with_footnotes(incident.postmortem_draft, citations))
     content_hash = hashlib.sha256(content.encode()).hexdigest()
     if await session.scalar(
         select(Document.id).where(

@@ -84,6 +84,8 @@ def payload(action: InvestigationAction, incident_id: uuid.UUID | None) -> dict[
             "title": action.title,
             "command": action.command,
             "risk": action.risk,
+            "verified": action.verified,
+            "flags": action.flags,
             "rationale": action.rationale,
             "approved_by": action.decided_by,
             "note": action.decision_note,

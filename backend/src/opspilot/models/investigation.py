@@ -1,6 +1,7 @@
 import enum
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -11,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
 )
@@ -59,6 +61,10 @@ class Investigation(IdMixin, CreatedAtMixin, Base):
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     invalid_citations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # What the run's tokens cost at the configured list prices
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    # Sources the agent saw that look like prompt injection (security/injection.py)
+    flagged_sources: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     latency_ms: Mapped[float | None] = mapped_column(Float)
     # The run hit the token budget and answered with the evidence it had by then
     budget_exhausted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -119,5 +125,10 @@ class InvestigationAction(IdMixin, CreatedAtMixin, Base):
     decided_by: Mapped[str | None] = mapped_column(String(100))
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     decision_note: Mapped[str | None] = mapped_column(Text)
+    # False when the command appears in none of the sources the action cites: the agent may
+    # have made it up, or been told to by injected text. Approving it needs confirmation.
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Injection flags of the sources it cites
+    flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     # What the actions webhook answered: {"status_code": 200, "body": "..."} or {"error": ...}
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

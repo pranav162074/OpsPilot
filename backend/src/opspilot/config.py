@@ -52,16 +52,29 @@ class Settings(BaseSettings):
     # constant (60 is the value from the original paper; higher flattens rank differences)
     search_candidates: int = 50
     rrf_k: int = 60
+    # A cross-encoder re-orders the top candidates (see search/rerank.py). Needs
+    # `uv sync --extra rerank`; the model (80 MB) downloads on first use.
+    reranker: Literal["none", "cross-encoder"] = "none"
+    reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
+    reranker_cache_dir: str | None = None
+    rerank_candidates: int = 20
 
     # The investigation agent's language model. Unset GEMINI_API_KEY (or llm_provider "none")
     # switches investigations off; everything else still works.
     llm_provider: Literal["none", "gemini"] = "gemini"
     llm_model: str = "gemini-3.8-flash"
+    # List prices (USD per million tokens) for cost tracking. Defaults: gemini-3.8-flash's
+    # standard rate (introductory $0.75 / $3.75 until 2026-12-31; the free tier costs nothing,
+    # but the figure still shows what the traffic would cost)
+    llm_input_usd_per_mtok: float = 1.50
+    llm_output_usd_per_mtok: float = 7.50
     # Tool-use rounds before the agent must answer with what it has
     agent_max_steps: int = 6
     # The reviewer can send a draft back for one revision
     agent_reflection: bool = True
     agent_timeout_seconds: float = 90.0
+    # Streamed investigations send a comment this often, so proxies keep the connection open
+    sse_heartbeat_seconds: float = 10.0
     # How the agent works. "react": reason → call a tool → repeat (quick questions).
     # "plan": plan the evidence → gather it in parallel → hypotheses → verify each → answer
     # (incidents). Either can be chosen per investigation.
@@ -107,6 +120,7 @@ class Settings(BaseSettings):
         "gemini_api_key",
         "integrations_key",
         "integrations_allow_private_urls",
+        "reranker_cache_dir",
         mode="before",
     )
     @classmethod

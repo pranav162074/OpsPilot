@@ -105,7 +105,8 @@ def answer_with_actions(ids: list[str]) -> str:
             "command": "kubectl rollout undo deployment/payments-api",
             "risk": "medium",
             "rationale": "The runbook's rollback",
-            "citations": [ids[0], str(uuid.uuid4())],
+            # Everything it read, plus an id it made up (dropped)
+            "citations": [*ids, str(uuid.uuid4())],
         },
         {"title": "Raise the pool size", "risk": "extreme"},
     ]
@@ -221,8 +222,12 @@ async def test_plan_strategy_gathers_hypothesizes_verifies_and_answers(
         ("Raise the pool size", "high", "proposed"),
     ]
     # Only citations of evidence the agent actually saw are kept
-    assert actions[0]["citations"] == [body["citations"][0]["chunk_id"]]
+    seen = {e for e in evidence_ids(model.calls[3])}
+    assert set(actions[0]["citations"]) == seen
     assert actions[0]["command"] == "kubectl rollout undo deployment/payments-api"
+    # The command is in the rolling-back passage it cites: verified
+    assert actions[0]["verified"] is True
+    assert actions[0]["flags"] == []
 
 
 async def test_an_unusable_plan_still_searches_the_runbooks(

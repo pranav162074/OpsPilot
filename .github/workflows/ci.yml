@@ -72,3 +72,51 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+  quality:
+    name: Retrieval quality gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: opspilot
+          POSTGRES_PASSWORD: opspilot
+          POSTGRES_DB: opspilot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U opspilot -d opspilot"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://opspilot:opspilot@localhost:5432/opspilot
+      # Deterministic, offline embeddings: the gate measures search, not a model's mood
+      EMBEDDING_PROVIDER: hashing
+      LLM_PROVIDER: none
+      RERANKER_CACHE_DIR: ${{ github.workspace }}/.cache/rerank
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (with the re-ranker)
+        run: uv sync --locked --extra rerank
+
+      # The cross-encoder (80 MB) is downloaded once, then cached
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/rerank
+          key: rerank-ms-marco-MiniLM-L-6-v2
+
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+
+      # Fails the build if hit@1, hit@3 or MRR drops below evals/thresholds.json
+      - name: Evaluate retrieval
+        run: uv run python -m opspilot.evals.retrieval --check

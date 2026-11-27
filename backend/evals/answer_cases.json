@@ -1,0 +1,42 @@
+[
+  {
+    "question": "Checkout requests hang and then fail with ERR_POOL_TIMEOUT. What do I do?",
+    "expected": "payments-api-runbook.md",
+    "must_mention": ["pg_stat_activity", "pg_cancel_backend"]
+  },
+  {
+    "question": "PaymentsApi5xxHigh fired right after a deploy. How do I roll back?",
+    "expected": "payments-api-runbook.md",
+    "must_mention": ["kubectl rollout undo deployment/payments-api"]
+  },
+  {
+    "question": "The main database server died. How do I switch to the standby?",
+    "expected": "postgres-failover.md",
+    "must_mention": ["pg_promote", "db-primary.internal"]
+  },
+  {
+    "question": "Redis writes fail with OOM command not allowed. What should I check?",
+    "expected": "redis-memory.md",
+    "must_mention": ["--bigkeys", "maxmemory-policy"]
+  },
+  {
+    "question": "Our cache cluster is evicting data. Which eviction policy should it use?",
+    "expected": "redis-memory.md",
+    "must_mention": ["allkeys-lru"]
+  },
+  {
+    "question": "OrderEventsLagHigh: consumers keep getting partitions reassigned. Why, and what do I tune?",
+    "expected": "kafka-consumer-lag.md",
+    "must_mention": ["max.poll.interval.ms", "max.poll.records"]
+  },
+  {
+    "question": "A pod keeps restarting with exit code 137. How do I find out why?",
+    "expected": "k8s-crashloop.md",
+    "must_mention": ["--previous"]
+  },
+  {
+    "question": "Why did the whole website go down in March?",
+    "expected": "postmortem-2026-03-cdn-outage.md",
+    "must_mention": ["certificate"]
+  }
+]

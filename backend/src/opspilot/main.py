@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
@@ -16,6 +17,7 @@ from opspilot.api import (
     investigations,
     search,
     telemetry,
+    usage,
     workspaces,
 )
 from opspilot.api.errors import register_error_handlers
@@ -27,6 +29,7 @@ from opspilot.logging import configure_logging
 from opspilot.mcp_server.http import McpEndpoint
 from opspilot.middleware import RequestIdMiddleware
 from opspilot.ratelimit import RateLimiter
+from opspilot.search.rerank import build_reranker
 from opspilot.worker import enqueue_ingestion, enqueue_investigation
 
 
@@ -49,6 +52,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.enqueue_investigation = enqueue_investigation
         app.state.embedder = build_embedder(settings)
         app.state.llm = build_chat_model(settings)
+        app.state.reranker = build_reranker(settings)
+        # Streamed investigations run as tasks owned by the app, not by their connection
+        app.state.running_investigations = set()
         app.state.query_cache = QueryEmbeddingCache(
             app.state.redis, settings.query_embedding_cache_seconds
         )
@@ -63,6 +69,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await stack.enter_async_context(mcp.running())
                 yield
         finally:
+            # Streamed runs still going are stopped; they stay "running" with their
+            # checkpoint, and the scheduler resumes them in a worker
+            for task in list(app.state.running_investigations):
+                task.cancel()
+            await asyncio.gather(*app.state.running_investigations, return_exceptions=True)
             await app.state.telemetry_http.aclose()
             await app.state.embedder.aclose()
             await app.state.redis.aclose()
@@ -80,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(incidents.router)
     app.include_router(telemetry.router)
     app.include_router(actions.router)
+    app.include_router(usage.router)
     if settings.mcp_enabled:
         # The same tools for AI assistants, at /mcp (see opspilot/mcp_server)
         mcp = McpEndpoint(app, settings)
