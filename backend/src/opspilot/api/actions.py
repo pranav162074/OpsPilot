@@ -32,6 +32,10 @@ class ActionOut(BaseModel):
     rationale: str | None
     risk: str
     citations: list[str]
+    # False: the command appears in none of the cited sources. flags: injection heuristics
+    # the cited sources trip. Either way, approving needs "confirm_unverified": true.
+    verified: bool
+    flags: list[str]
     status: ActionStatus
     decided_by: str | None
     decided_at: datetime | None
@@ -43,6 +47,11 @@ class ActionOut(BaseModel):
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     note: Annotated[str | None, Field(max_length=2000)] = None
+
+
+class Approval(Decision):
+    # Required for an action whose command isn't in its sources, or whose sources are flagged
+    confirm_unverified: bool = False
 
 
 async def _load(session: SessionDep, principal: Principal, action_id: uuid.UUID) -> Any:
@@ -174,10 +183,23 @@ async def approve_action(
     principal: Responder,
     session: SessionDep,
     settings: SettingsDep,
-    body: Decision | None = None,
+    body: Approval | None = None,
 ) -> ActionOut:
     """Approves a proposed action, and sends it to the actions webhook if there is one."""
     note = body.note if body else None
+    current = await _load(session, principal, action_id)
+    if (not current.verified or current.flags) and not (body and body.confirm_unverified):
+        reasons = []
+        if not current.verified:
+            reasons.append("its command appears in none of the sources it cites")
+        if current.flags:
+            reasons.append(f"its sources look like prompt injection ({', '.join(current.flags)})")
+        raise ApiError(
+            409,
+            "confirmation_required",
+            f"Check this action yourself: {'; '.join(reasons)}. To approve it anyway, send "
+            '"confirm_unverified": true.',
+        )
     action = await _decide(
         session, principal, action_id, ActionStatus.APPROVED, ActionStatus.PROPOSED, note
     )

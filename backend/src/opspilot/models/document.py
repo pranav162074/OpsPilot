@@ -15,8 +15,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from opspilot.embeddings.base import DIMENSIONS
@@ -114,6 +115,10 @@ class Chunk(IdMixin, Base):
     # Markdown headings above this chunk, like "Database > Failover"
     heading: Mapped[str] = mapped_column(Text, nullable=False, default="")
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Prompt-injection heuristics this passage trips (security/injection.py); [] if none
+    flags: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     # Where the chunk sits in the document, so answers can point at the exact passage
     char_start: Mapped[int] = mapped_column(Integer, nullable=False)

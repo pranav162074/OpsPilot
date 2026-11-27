@@ -36,6 +36,7 @@ from opspilot.ingestion.service import (
     ingest_document,
 )
 from opspilot.logging import configure_logging, request_id_var
+from opspilot.search.rerank import build_reranker
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,7 @@ def run_investigation_task(investigation_id: str, request_id: str = "-") -> str:
                     embedder=embedder,
                     query_cache=QueryEmbeddingCache(redis, settings.query_embedding_cache_seconds),
                     telemetry_http=telemetry_http,
+                    reranker=build_reranker(settings),
                 )
             finally:
                 await telemetry_http.aclose()

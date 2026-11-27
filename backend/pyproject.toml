@@ -26,6 +26,11 @@ dependencies = [
 # OpsPilot's MCP tools over stdio, for desktop clients (see opspilot/mcp_server/stdio.py)
 opspilot-mcp = "opspilot.mcp_server.stdio:main"
 
+[project.optional-dependencies]
+rerank = [
+    "fastembed>=0.9",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
@@ -64,3 +69,8 @@ select = ["E", "F", "I", "B", "UP", "SIM", "ASYNC", "S"]
 [tool.mypy]
 strict = true
 plugins = ["pydantic.mypy"]
+
+# The re-ranker is an optional extra (uv sync --extra rerank); CI type-checks without it
+[[tool.mypy.overrides]]
+module = ["fastembed", "fastembed.*"]
+ignore_missing_imports = true

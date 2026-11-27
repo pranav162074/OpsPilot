@@ -14,7 +14,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -60,6 +60,14 @@ class Trace:
     tool_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Called with each event as it happens: how investigations are streamed (SSE)
+    listener: Callable[[dict[str, Any]], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def _emit(self) -> None:
+        if self.listener is not None:
+            self.listener(self.events[-1])
 
     def llm(self, node: str, message: BaseMessage, started: float) -> None:
         usage = getattr(message, "usage_metadata", None) or {}
@@ -78,6 +86,7 @@ class Trace:
                 "text": text_of(message)[:TRACE_TEXT_LIMIT],
             }
         )
+        self._emit()
 
     @property
     def tokens(self) -> int:
@@ -114,6 +123,7 @@ class Trace:
                 "output": output[:TRACE_TEXT_LIMIT],
             }
         )
+        self._emit()
 
 
 def text_of(message: BaseMessage) -> str:

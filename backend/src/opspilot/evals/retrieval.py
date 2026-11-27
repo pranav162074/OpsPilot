@@ -7,15 +7,20 @@ a command); half are paraphrases that share few words with the answer. Every mod
 - hit@1 / hit@3: share of questions whose answer is the top document / among the top 3
 - MRR: mean of 1/rank of the answer (1.0 means always first; 0 for a miss)
 
-    uv run python -m opspilot.evals.retrieval
+    uv run python -m opspilot.evals.retrieval                 # the table
+    uv run python -m opspilot.evals.retrieval --rerank        # plus hybrid + cross-encoder
+    uv run python -m opspilot.evals.retrieval --check         # fail below evals/thresholds.json
 
 uses EMBEDDING_PROVIDER from your settings. It creates a temporary workspace, indexes the
-corpus into it, and deletes it afterwards.
+corpus into it, and deletes it afterwards. --check is the CI quality gate: a change that
+makes search worse fails the build, the way a failing test does.
 """
 
+import argparse
 import asyncio
 import hashlib
 import json
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,8 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from opspilot.config import Settings, get_settings
 from opspilot.embeddings import Embedder, build_embedder
 from opspilot.ingestion.service import Outcome, ingest_document
-from opspilot.models import Chunk, Document, Workspace
-from opspilot.search.service import SearchMode, search_chunks
+from opspilot.models import Document, Workspace
+from opspilot.search.rerank import Reranker, build_reranker
+from opspilot.search.service import SearchMode, retrieve
+
+RERANKED = "hybrid+rerank"
 
 EVALS_DIR = Path(__file__).resolve().parents[3] / "evals"
 
@@ -72,7 +80,10 @@ async def _index_corpus(
 
 
 async def evaluate(
-    sessionmaker: async_sessionmaker[AsyncSession], settings: Settings, embedder: Embedder
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    embedder: Embedder,
+    reranker: Reranker | None = None,
 ) -> dict[str, dict[str, Score]]:
     """Scores, by mode, then by question kind ("all", "keyword", "semantic")."""
     questions = json.loads((EVALS_DIR / "queries.json").read_text(encoding="utf-8"))
@@ -84,13 +95,21 @@ async def evaluate(
 
     try:
         await _index_corpus(sessionmaker, settings, embedder, workspace_id)
-        ranks: dict[str, list[tuple[str, int | None]]] = {mode.value: [] for mode in SearchMode}
+        runs: list[tuple[str, SearchMode, Reranker | None]] = [
+            (mode.value, mode, None) for mode in SearchMode
+        ]
+        if reranker is not None:
+            runs.append((RERANKED, SearchMode.HYBRID, reranker))
+        ranks: dict[str, list[tuple[str, int | None]]] = {name: [] for name, _, _ in runs}
         for question in questions:
             query_vector = await embedder.embed_query(question["query"])
-            for mode in SearchMode:
+            for name, mode, rerank_with in runs:
                 async with sessionmaker() as session:
-                    fused = await search_chunks(
+                    found = await retrieve(
                         session,
+                        reranker=rerank_with,
+                        rerank_candidates=settings.rerank_candidates,
+                        limit=settings.search_candidates,
                         workspace_id=workspace_id,
                         query=question["query"],
                         mode=mode,
@@ -100,24 +119,17 @@ async def evaluate(
                         candidates=settings.search_candidates,
                         rrf_k=settings.rrf_k,
                     )
-                    rows = await session.execute(
-                        select(Chunk.id, Document.filename)
-                        .join(Document, Document.id == Chunk.document_id)
-                        .where(Chunk.id.in_([f.chunk_id for f in fused]))
-                    )
-                    filenames = {row.id: row.filename for row in rows}
                 # Rank documents, not chunks: a document's rank is that of its best chunk
                 documents: list[str] = []
-                for item in fused:
-                    name = filenames[item.chunk_id]
-                    if name not in documents:
-                        documents.append(name)
+                for _, _, document in found.results:
+                    if document.filename not in documents:
+                        documents.append(document.filename)
                 rank = (
                     documents.index(question["expected"]) + 1
                     if question["expected"] in documents
                     else None
                 )
-                ranks[mode.value].append((question["kind"], rank))
+                ranks[name].append((question["kind"], rank))
     finally:
         async with sessionmaker() as session:
             await session.execute(delete(Workspace).where(Workspace.id == workspace_id))
@@ -144,27 +156,87 @@ async def evaluate(
     }
 
 
-async def _main() -> None:
-    settings = get_settings()
+def check(
+    report: dict[str, dict[str, Score]], thresholds: dict[str, dict[str, float]]
+) -> list[str]:
+    """Every metric below its threshold, as readable lines (empty: the gate passes)."""
+    failures = []
+    for mode, metrics in thresholds.items():
+        if mode not in report:
+            failures.append(f"{mode}: not evaluated (is the re-ranker installed?)")
+            continue
+        scored = report[mode]["all"]
+        for metric, minimum in metrics.items():
+            value = getattr(scored, metric)
+            if value + 1e-9 < minimum:
+                failures.append(f"{mode} {metric} = {value:.3f}, below {minimum:.3f}")
+    return failures
+
+
+def print_table(model: str, report: dict[str, dict[str, Score]]) -> None:
+    print(f"Embedding model: {model}\n")
+    print(f"{'mode':<14} {'questions':>9} {'hit@1':>7} {'hit@3':>7} {'MRR':>6}")
+    for mode, by_kind in report.items():
+        for kind, s in by_kind.items():
+            label = mode if kind == "all" else f"  {kind}"
+            print(
+                f"{label:<14} {s.questions:>9} {s.hit_at_1:>7.2f} {s.hit_at_3:>7.2f} {s.mrr:>6.2f}"
+            )
+
+
+async def _run(settings: Settings, thresholds: dict[str, dict[str, float]], rerank: bool) -> int:
+    reranker = (
+        build_reranker(settings.model_copy(update={"reranker": "cross-encoder"}))
+        if rerank or RERANKED in thresholds
+        else None
+    )
     embedder = build_embedder(settings)
     engine = create_async_engine(settings.database_url)
     try:
         report = await evaluate(
-            async_sessionmaker(engine, expire_on_commit=False), settings, embedder
+            async_sessionmaker(engine, expire_on_commit=False), settings, embedder, reranker
         )
     finally:
         await embedder.aclose()
         await engine.dispose()
 
-    print(f"Embedding model: {embedder.model}\n")
-    print(f"{'mode':<12} {'questions':>9} {'hit@1':>7} {'hit@3':>7} {'MRR':>6}")
-    for mode, by_kind in report.items():
-        for kind, s in by_kind.items():
-            label = mode if kind == "all" else f"  {kind}"
-            print(
-                f"{label:<12} {s.questions:>9} {s.hit_at_1:>7.2f} {s.hit_at_3:>7.2f} {s.mrr:>6.2f}"
-            )
+    print_table(embedder.model, report)
+    if not thresholds:
+        return 0
+    failures = check(report, thresholds)
+    if failures:
+        print("\nQuality gate FAILED:\n  " + "\n  ".join(failures))
+        return 1
+    print(f"\nQuality gate passed ({sum(len(m) for m in thresholds.values())} thresholds)")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="python -m opspilot.evals.retrieval")
+    parser.add_argument("--rerank", action="store_true", help="Also score hybrid + re-ranker")
+    parser.add_argument(
+        "--check",
+        nargs="?",
+        const=str(EVALS_DIR / "thresholds.json"),
+        metavar="THRESHOLDS",
+        help="Exit 1 if any score is below its threshold (default: evals/thresholds.json)",
+    )
+    args = parser.parse_args()
+    settings = get_settings()
+    thresholds: dict[str, dict[str, float]] = {}
+    if args.check:
+        by_provider = json.loads(Path(args.check).read_text(encoding="utf-8"))
+        thresholds = by_provider.get(embedder_key(settings), {})
+        if not thresholds:
+            print(f"No thresholds for EMBEDDING_PROVIDER={embedder_key(settings)}")
+            return 1
+    return asyncio.run(_run(settings, thresholds, args.rerank))
+
+
+def embedder_key(settings: Settings) -> str:
+    """Thresholds are per embedding provider: hashing and Gemini score very differently."""
+    return settings.embedding_provider
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    sys.exit(main())

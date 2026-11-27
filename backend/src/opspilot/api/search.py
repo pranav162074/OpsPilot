@@ -10,7 +10,7 @@ from opspilot.api.errors import ApiError
 from opspilot.embeddings import Embedder, EmbeddingError, EmbeddingUnavailable
 from opspilot.embeddings.cache import QueryEmbeddingCache
 from opspilot.models import SourceType
-from opspilot.search.service import SearchMode, load_results, search_chunks
+from opspilot.search.service import SearchMode, retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,8 @@ class SearchRequest(BaseModel):
     limit: Annotated[int, Field(ge=1, le=50)] = 10
     mode: SearchMode = SearchMode.HYBRID
     source_types: list[SourceType] | None = None
+    # Re-order the top candidates with the cross-encoder, if the server has one
+    rerank: bool = True
 
 
 class Ranks(BaseModel):
@@ -41,13 +43,19 @@ class SearchResult(BaseModel):
     char_end: int
     score: float
     ranks: Ranks
+    # The cross-encoder's relevance score, when the results were re-ranked
+    rerank_score: float | None
+    # Prompt-injection heuristics the passage trips (see the README); [] if none
+    flags: list[str]
 
 
 class SearchResponse(BaseModel):
     query: str
     mode: SearchMode
-    # True when hybrid search fell back to keywords only because embeddings were unavailable
+    # True when hybrid search fell back to keywords only because embeddings were unavailable,
+    # or re-ranking failed and the results are in fusion order
     degraded: bool
+    reranked: bool
     results: list[SearchResult]
 
 
@@ -77,8 +85,11 @@ async def search(
             logger.warning("Embedding the query failed; falling back to keyword search: %s", exc)
             degraded = True
 
-    fused = await search_chunks(
+    found = await retrieve(
         session,
+        reranker=request.app.state.reranker if body.rerank else None,
+        rerank_candidates=settings.rerank_candidates,
+        limit=body.limit,
         workspace_id=principal.workspace.id,
         query=body.query,
         mode=body.mode,
@@ -100,7 +111,15 @@ async def search(
             char_end=chunk.char_end,
             score=round(item.score, 6),
             ranks=Ranks(vector=item.ranks.get("vector"), keyword=item.ranks.get("keyword")),
+            rerank_score=None if item.rerank_score is None else round(item.rerank_score, 4),
+            flags=list(chunk.flags or []),
         )
-        for item, chunk, document in await load_results(session, fused[: body.limit])
+        for item, chunk, document in found.results
     ]
-    return SearchResponse(query=body.query, mode=body.mode, degraded=degraded, results=results)
+    return SearchResponse(
+        query=body.query,
+        mode=body.mode,
+        degraded=degraded or found.rerank_failed,
+        reranked=found.reranked,
+        results=results,
+    )

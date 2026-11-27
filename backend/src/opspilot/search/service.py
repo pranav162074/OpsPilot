@@ -12,11 +12,13 @@ import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from opspilot.models import Chunk, Document, SourceType
+from opspilot.search.rerank import Reranker
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,8 @@ class Fused:
     score: float
     # 1-based rank in each retriever's list, or None if that retriever didn't find it
     ranks: dict[str, int | None] = field(default_factory=dict)
+    # The cross-encoder's score, when the results were re-ranked
+    rerank_score: float | None = None
 
 
 def reciprocal_rank_fusion(rankings: Mapping[str, Sequence[uuid.UUID]], k: int) -> list[Fused]:
@@ -147,3 +151,42 @@ async def search_chunks(
             session, workspace_id, query, source_types, candidates
         )
     return reciprocal_rank_fusion(rankings, rrf_k)
+
+
+@dataclass
+class Retrieval:
+    results: list[tuple[Fused, Chunk, Document]]
+    reranked: bool
+    # Re-ranking was asked for but failed: these are in fusion order
+    rerank_failed: bool = False
+
+
+async def retrieve(
+    session: AsyncSession,
+    *,
+    reranker: Reranker | None,
+    rerank_candidates: int,
+    limit: int,
+    **search: Any,
+) -> Retrieval:
+    """Search, then (with a re-ranker) re-order the top candidates by the cross-encoder.
+
+    Everything that searches (the API, the agent's tool, the evaluation) goes through here,
+    so they all rank the same way. A re-ranker that fails costs ordering, not results."""
+    fused = await search_chunks(session, **search)
+    if reranker is None or not fused:
+        return Retrieval(await load_results(session, fused[:limit]), reranked=False)
+    candidates = await load_results(session, fused[: max(limit, rerank_candidates)])
+    query: str = search["query"]
+    try:
+        scores = await reranker.score(
+            query, [f"{chunk.heading}\n{chunk.content}" for _, chunk, _ in candidates]
+        )
+    except Exception:
+        logger.exception("Re-ranking failed; keeping the fusion order")
+        return Retrieval(candidates[:limit], reranked=False, rerank_failed=True)
+    for (item, _, _), score in zip(candidates, scores, strict=True):
+        item.rerank_score = score
+    # Stable: equal scores keep their fusion order
+    ordered = sorted(candidates, key=lambda r: -(r[0].rerank_score or 0.0))
+    return Retrieval(ordered[:limit], reranked=True)

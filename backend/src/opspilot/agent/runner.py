@@ -13,8 +13,10 @@ finished stage, up to agent_max_attempts claims in all.
 import enum
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 from langchain_core.language_models import BaseChatModel
@@ -33,6 +35,7 @@ from opspilot.models import (
     SourceType,
 )
 from opspilot.models.incident import Incident, IncidentEvent
+from opspilot.search.rerank import Reranker
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,8 @@ async def _finish(
             row.latency_ms = result.latency_ms
             row.hypotheses = result.hypotheses
             row.budget_exhausted = result.budget_exhausted
+            row.cost_usd = result.cost_usd
+            row.flagged_sources = result.flagged_sources
             for position, action in enumerate(result.actions):
                 session.add(
                     InvestigationAction(
@@ -121,6 +126,8 @@ async def execute_investigation(
     embedder: Embedder,
     query_cache: QueryEmbeddingCache,
     telemetry_http: httpx.AsyncClient | None = None,
+    reranker: Reranker | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> RunOutcome:
     async with sessionmaker() as session:
         claimed = (
@@ -183,6 +190,8 @@ async def execute_investigation(
             strategy=claimed.strategy,
             checkpoint=claimed.checkpoint,
             on_checkpoint=save_checkpoint,
+            reranker=reranker,
+            on_event=on_event,
         )
     except TimeoutError:
         await _finish(

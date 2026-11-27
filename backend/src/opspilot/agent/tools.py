@@ -15,7 +15,9 @@ from opspilot.config import Settings
 from opspilot.embeddings import Embedder, EmbeddingError, EmbeddingUnavailable
 from opspilot.embeddings.cache import QueryEmbeddingCache
 from opspilot.models import Chunk, Document, SourceType
-from opspilot.search.service import SearchMode, load_results, search_chunks
+from opspilot.search.rerank import Reranker
+from opspilot.search.service import SearchMode, retrieve
+from opspilot.security.injection import fence, scan
 from opspilot.telemetry.clients import TelemetryError
 from opspilot.telemetry.service import (
     MAX_WINDOW_MINUTES,
@@ -43,6 +45,8 @@ class Source:
     # "document" for a passage; "metrics", "logs" or "changes" for something the agent
     # observed in the workspace's telemetry
     kind: str = "document"
+    # Prompt-injection heuristics the text trips (security/injection.py)
+    flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -54,8 +58,17 @@ class Retrieved:
 
     def add(self, chunk: Chunk, document: Document) -> None:
         self.sources[chunk.id] = Source(
-            chunk.id, document.id, document.title, chunk.heading, chunk.content
+            chunk.id,
+            document.id,
+            document.title,
+            chunk.heading,
+            chunk.content,
+            flags=list(chunk.flags or []),
         )
+
+    @property
+    def flagged(self) -> int:
+        return sum(1 for s in self.sources.values() if s.flags)
 
     def to_json(self) -> list[dict[str, Any]]:
         return [
@@ -66,6 +79,7 @@ class Retrieved:
                 "heading": s.heading,
                 "content": s.content,
                 "kind": s.kind,
+                "flags": s.flags,
             }
             for s in self.sources.values()
         ]
@@ -81,15 +95,18 @@ class Retrieved:
                 heading=item["heading"],
                 content=item["content"],
                 kind=item.get("kind", "document"),
+                flags=list(item.get("flags", [])),
             )
             retrieved.sources[source.chunk_id] = source
         return retrieved
 
-    def observe(self, kind: str, title: str, heading: str, content: str) -> uuid.UUID:
+    def observe(
+        self, kind: str, title: str, heading: str, content: str, flags: list[str]
+    ) -> uuid.UUID:
         """Records a telemetry result under a fresh id, so it can be cited (and checked by the
         reviewer) exactly like a document passage."""
         source_id = uuid.uuid4()
-        self.sources[source_id] = Source(source_id, None, title, heading, content, kind)
+        self.sources[source_id] = Source(source_id, None, title, heading, content, kind, flags)
         return source_id
 
 
@@ -98,7 +115,7 @@ def _format(chunk: Chunk, document: Document) -> str:
     if len(content) > MAX_PASSAGE_CHARS:
         content = content[:MAX_PASSAGE_CHARS] + " [...]"
     location = f"{document.title} > {chunk.heading}" if chunk.heading else document.title
-    return f"[c:{chunk.id}] {location}\n{content}"
+    return f"[c:{chunk.id}] {location}\n{fence(content, list(chunk.flags or []))}"
 
 
 class SearchArgs(BaseModel):
@@ -121,6 +138,7 @@ def build_tools(
     workspace_id: uuid.UUID,
     retrieved: Retrieved,
     default_source_types: Sequence[SourceType] | None = None,
+    reranker: Reranker | None = None,
 ) -> list[BaseTool]:
     async def search_knowledge_base(
         query: str, source_types: list[SourceType] | None = None
@@ -130,8 +148,11 @@ def build_tools(
         except (EmbeddingUnavailable, EmbeddingError):
             vector = None  # keyword search still works
         async with sessionmaker() as session:
-            fused = await search_chunks(
+            found = await retrieve(
                 session,
+                reranker=reranker,
+                rerank_candidates=settings.rerank_candidates,
+                limit=5,
                 workspace_id=workspace_id,
                 query=query,
                 mode=SearchMode.HYBRID,
@@ -141,7 +162,7 @@ def build_tools(
                 candidates=settings.search_candidates,
                 rrf_k=settings.rrf_k,
             )
-            results = await load_results(session, fused[:5])
+            results = found.results
         if not results:
             return "No matching passages. Try different words."
         for _, chunk, document in results:
@@ -226,8 +247,11 @@ class ChangesArgs(BaseModel):
 
 
 def _cite(retrieved: Retrieved, kind: str, title: str, heading: str, text: str) -> str:
-    source_id = retrieved.observe(kind, title, heading, text)
-    return f"[c:{source_id}] {title} > {heading}\n{text}"
+    # Logs and commit messages are written by anyone who can make a request or a commit:
+    # as untrusted as documents
+    flags = scan(text)
+    source_id = retrieved.observe(kind, title, heading, text, flags)
+    return f"[c:{source_id}] {title} > {heading}\n{fence(text, flags)}"
 
 
 def build_telemetry_tools(

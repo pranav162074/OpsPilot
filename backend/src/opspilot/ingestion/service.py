@@ -22,6 +22,7 @@ from opspilot.config import Settings
 from opspilot.embeddings import Embedder, EmbeddingError, EmbeddingUnavailable
 from opspilot.ingestion.chunking import ChunkDraft, chunk_text
 from opspilot.models import Chunk, Document, DocumentStatus
+from opspilot.security.injection import scan
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,7 @@ async def _process(
                         "ordinal": draft.ordinal,
                         "heading": draft.heading,
                         "content": draft.content,
+                        "flags": scan(f"{draft.heading}\n{draft.content}"),
                         "token_count": draft.token_count,
                         "char_start": draft.char_start,
                         "char_end": draft.char_end,

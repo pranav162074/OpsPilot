@@ -82,6 +82,8 @@ async def test_answers_with_citations_and_a_full_trace(
         "input_tokens": 300,
         "output_tokens": 60,
         "latency_ms": body["usage"]["latency_ms"],
+        # 300 × $1.50 + 60 × $7.50 per million tokens
+        "cost_usd": "0.000900",
     }
     assert [(e["type"], e.get("node") or e.get("name")) for e in body["trace"]] == [
         ("llm", "agent"),

@@ -16,6 +16,7 @@ from opspilot.api.deps import Responder, SessionDep, SettingsDep, Viewer
 from opspilot.api.errors import ApiError
 from opspilot.api.schemas import ChunkOut, DocumentOut, DocumentPage
 from opspilot.models import Chunk, Document, DocumentStatus, SourceType
+from opspilot.security.injection import remove_invisible
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,9 @@ def _decode(data: bytes) -> str:
         raise ApiError(422, "invalid_encoding", "The file must be UTF-8 text") from exc
     if "\x00" in text:
         raise ApiError(422, "invalid_encoding", "The file looks binary, not text")
-    # Same text from Windows and Linux should hash the same, so duplicates are caught
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    # Same text from Windows and Linux should hash the same, so duplicates are caught.
+    # Invisible characters go: they can carry instructions a reviewer would never see.
+    return remove_invisible(text.replace("\r\n", "\n").replace("\r", "\n"))
 
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
