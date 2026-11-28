@@ -21,3 +21,6 @@ demo/alertmanager/secrets/*
 !demo/alertmanager/secrets/.gitkeep
 demo/.demo-env
 demo/simulations.jsonl
+
+# Original files kept by STORAGE_BACKEND=local
+backend/data/

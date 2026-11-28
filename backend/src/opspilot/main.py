@@ -11,11 +11,13 @@ from opspilot.agent.llm import build_chat_model
 from opspilot.api import (
     actions,
     api_keys,
+    dead_letters,
     documents,
     health,
     incidents,
     investigations,
     search,
+    sources,
     telemetry,
     usage,
     workspaces,
@@ -30,7 +32,8 @@ from opspilot.mcp_server.http import McpEndpoint
 from opspilot.middleware import RequestIdMiddleware
 from opspilot.ratelimit import RateLimiter
 from opspilot.search.rerank import build_reranker
-from opspilot.worker import enqueue_ingestion, enqueue_investigation
+from opspilot.storage import S3Store, build_store
+from opspilot.worker import enqueue_ingestion, enqueue_investigation, enqueue_source_sync
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -50,9 +53,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Swappable, so tests can capture what would be queued
         app.state.enqueue_ingestion = enqueue_ingestion
         app.state.enqueue_investigation = enqueue_investigation
+        app.state.enqueue_source_sync = enqueue_source_sync
         app.state.embedder = build_embedder(settings)
         app.state.llm = build_chat_model(settings)
         app.state.reranker = build_reranker(settings)
+        app.state.store = build_store(settings)
+        if isinstance(app.state.store, S3Store) and settings.environment == "development":
+            # MinIO from docker compose starts empty
+            await app.state.store.ensure_bucket()
         # Streamed investigations run as tasks owned by the app, not by their connection
         app.state.running_investigations = set()
         app.state.query_cache = QueryEmbeddingCache(
@@ -92,6 +100,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(telemetry.router)
     app.include_router(actions.router)
     app.include_router(usage.router)
+    app.include_router(sources.router)
+    app.include_router(dead_letters.router)
     if settings.mcp_enabled:
         # The same tools for AI assistants, at /mcp (see opspilot/mcp_server)
         mcp = McpEndpoint(app, settings)

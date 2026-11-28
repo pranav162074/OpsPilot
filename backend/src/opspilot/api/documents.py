@@ -12,17 +12,22 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
+from opspilot import dead_letters
 from opspilot.api.deps import Responder, SessionDep, SettingsDep, Viewer
 from opspilot.api.errors import ApiError
 from opspilot.api.schemas import ChunkOut, DocumentOut, DocumentPage
+from opspilot.ingestion.code import CODE_MEDIA_PREFIX, LANGUAGES, media_type_for
 from opspilot.models import Chunk, Document, DocumentStatus, SourceType
 from opspilot.security.injection import remove_invisible
+from opspilot.storage import ObjectStore, StorageError, document_key
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
 
-MEDIA_TYPES = {".md": "text/markdown", ".markdown": "text/markdown", ".txt": "text/plain"}
+MEDIA_TYPES = {".md": "text/markdown", ".markdown": "text/markdown", ".txt": "text/plain"} | {
+    suffix: media_type_for(language) for suffix, language in LANGUAGES.items()
+}
 # Room for the multipart boundaries and the other form fields around the file
 MULTIPART_OVERHEAD = 16 * 1024
 
@@ -73,7 +78,11 @@ async def upload_document(
     filename = PurePath(file.filename or "").name
     media_type = MEDIA_TYPES.get(PurePath(filename).suffix.lower())
     if media_type is None:
-        raise ApiError(415, "unsupported_file_type", "Upload a .md, .markdown or .txt file")
+        raise ApiError(
+            415,
+            "unsupported_file_type",
+            "Upload a .md, .markdown or .txt file, or source code (.py, .ts, .go, ...)",
+        )
 
     data = await file.read(limit + 1)
     if len(data) > limit:
@@ -88,7 +97,10 @@ async def upload_document(
     async def duplicate() -> ApiError | None:
         existing = await session.scalar(
             select(Document.id).where(
-                Document.workspace_id == workspace_id, Document.content_hash == content_hash
+                Document.workspace_id == workspace_id,
+                Document.content_hash == content_hash,
+                # Synced files don't count: the same text can be in a repository and uploaded
+                Document.source_id.is_(None),
             )
         )
         if existing is None:
@@ -103,11 +115,30 @@ async def upload_document(
     if error := await duplicate():
         raise error
 
+    document_id = uuid.uuid4()
+    store: ObjectStore = request.app.state.store
+    storage_key: str | None = None
+    if store.name != "none":
+        # The original first: if the database write fails, an orphan object is harmless; a
+        # document pointing at a missing object isn't
+        storage_key = document_key(workspace_id, document_id, data)
+        try:
+            await store.put(storage_key, data, media_type)
+        except StorageError as exc:
+            logger.warning("Couldn't store the original of %s: %s", filename, exc)
+            raise ApiError(
+                503, "storage_unavailable", "File storage is unavailable; try again shortly"
+            ) from exc
+
+    is_code = media_type.startswith(CODE_MEDIA_PREFIX)
     document = Document(
+        id=document_id,
         workspace_id=workspace_id,
         title=(title or "").strip() or PurePath(filename).stem or "Untitled",
         filename=filename,
-        source_type=source_type.value,
+        # Code is code, whatever the form said (it's chunked by function)
+        source_type=SourceType.CODE.value if is_code else source_type.value,
+        storage_key=storage_key,
         media_type=media_type,
         content=content,
         content_hash=content_hash,
@@ -236,9 +267,54 @@ async def reingest_document(
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
-    document_id: uuid.UUID, principal: Responder, session: SessionDep
+    document_id: uuid.UUID, request: Request, principal: Responder, session: SessionDep
 ) -> Response:
     document = await _get(session, principal, document_id)
+    storage_key = document.storage_key
     await session.delete(document)  # chunks go with it (ON DELETE CASCADE)
     await session.commit()
+    if storage_key:
+        try:
+            await request.app.state.store.delete(storage_key)
+        except StorageError as exc:
+            # The document is gone either way; the leftover file is retried from the
+            # dead-letter queue
+            await dead_letters.record_now(
+                request.app.state.sessionmaker,
+                task=dead_letters.DELETE_OBJECT,
+                job_key=f"object:{storage_key}",
+                payload={"key": storage_key},
+                error=str(exc),
+                workspace_id=principal.workspace.id,
+            )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{document_id}/original")
+async def download_original(
+    document_id: uuid.UUID, request: Request, principal: Viewer, session: SessionDep
+) -> Response:
+    """The file as it was uploaded (or synced), byte for byte, when storage keeps originals."""
+    document = await _get(session, principal, document_id)
+    if document.storage_key is None:
+        raise ApiError(404, "no_original", "The original file isn't kept for this document")
+    try:
+        data = await request.app.state.store.get(document.storage_key)
+    except StorageError as exc:
+        raise ApiError(503, "storage_unavailable", "File storage is unavailable") from exc
+    if data is None:
+        raise ApiError(404, "no_original", "The original file is missing from storage")
+    return Response(
+        content=data,
+        media_type=document.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{_safe_filename(document.filename)}"',
+            # Never rendered as a page: an uploaded .html would otherwise run in our origin
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox",
+        },
+    )
+
+
+def _safe_filename(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._- " else "_" for c in name)[:200] or "document"

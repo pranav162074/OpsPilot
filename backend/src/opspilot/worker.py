@@ -18,6 +18,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from opspilot import dead_letters
 from opspilot.agent.llm import build_chat_model
 from opspilot.agent.runner import (
     Recovery,
@@ -36,7 +37,10 @@ from opspilot.ingestion.service import (
     ingest_document,
 )
 from opspilot.logging import configure_logging, request_id_var
+from opspilot.models import Source
 from opspilot.search.rerank import build_reranker
+from opspilot.sources.sync import SyncResult, SyncRetry, due_sources, sync_source
+from opspilot.storage import build_store
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,8 @@ INGEST_TASK = "opspilot.ingest_document"
 REQUEUE_TASK = "opspilot.requeue_stuck_documents"
 INVESTIGATION_TASK = "opspilot.run_investigation"
 ABANDONED_TASK = "opspilot.recover_abandoned_investigations"
+SYNC_TASK = "opspilot.sync_source"
+DUE_SOURCES_TASK = "opspilot.sync_due_sources"
 
 celery_app = Celery("opspilot", broker=get_settings().celery_broker_url)
 celery_app.conf.update(
@@ -62,6 +68,8 @@ celery_app.conf.update(
     beat_schedule={
         "requeue-stuck-documents": {"task": REQUEUE_TASK, "schedule": 60.0},
         "recover-abandoned-investigations": {"task": ABANDONED_TASK, "schedule": 120.0},
+        # The catch-up for push webhooks that never arrived
+        "sync-due-sources": {"task": DUE_SOURCES_TASK, "schedule": 300.0},
     },
 )
 
@@ -203,3 +211,88 @@ def recover_abandoned_investigations_task() -> int:
             recovery.failed,
         )
     return len(recovery.resumed) + recovery.failed
+
+
+class DeadLetterOnFailure(Task):  # type: ignore[type-arg]
+    """Tasks whose last failure (out of retries, or an error retrying can't fix) goes to the
+    dead-letter queue instead of only the log."""
+
+    dead_letter_task = "unknown"
+
+    def on_failure(
+        self, exc: BaseException, task_id: str, args: Any, kwargs: Any, einfo: Any
+    ) -> None:
+        subject = (args or [None])[0] or kwargs.get("source_id")
+
+        async def job(sessionmaker: async_sessionmaker[AsyncSession], settings: Settings) -> None:
+            workspace_id = None
+            if self.dead_letter_task == dead_letters.SOURCE_SYNC and subject:
+                async with sessionmaker() as session:
+                    source = await session.get(Source, uuid.UUID(str(subject)))
+                    workspace_id = source.workspace_id if source else None
+            await dead_letters.record_now(
+                sessionmaker,
+                task=self.dead_letter_task,
+                job_key=f"source:{subject}",
+                payload={
+                    "source_id": str(subject),
+                    **{k: v for k, v in kwargs.items() if k == "force"},
+                },
+                error=f"{type(exc).__name__}: {exc}",
+                attempts=self.request.retries + 1,
+                workspace_id=workspace_id,
+            )
+
+        try:
+            _run(job)
+        except Exception:
+            logger.exception("Couldn't record the dead letter for task %s", task_id)
+
+
+@celery_app.task(
+    name=SYNC_TASK,
+    bind=True,
+    base=DeadLetterOnFailure,
+    dead_letter_task=dead_letters.SOURCE_SYNC,
+    max_retries=5,
+)
+def sync_source_task(self: Task[Any, Any], source_id: str, force: bool = False) -> dict[str, Any]:
+    async def job(sessionmaker: async_sessionmaker[AsyncSession], settings: Settings) -> SyncResult:
+        async with httpx.AsyncClient() as http:
+            result = await sync_source(
+                sessionmaker,
+                settings,
+                uuid.UUID(source_id),
+                http,
+                build_store(settings),
+                force=force,
+                attempt=self.request.retries + 1,
+            )
+        for document_id in result.queued:
+            enqueue_ingestion(document_id)
+        return result
+
+    try:
+        return _run(job).summary()
+    except SyncRetry as exc:
+        # 30s, 1m, 2m, 4m, 8m: or as long as GitHub's rate limit says
+        countdown = max(30 * 2**self.request.retries, int(exc.retry_after or 0))
+        raise self.retry(exc=exc, countdown=min(countdown, 3600)) from exc
+
+
+def enqueue_source_sync(source_id: uuid.UUID, force: bool = False) -> None:
+    sync_source_task.apply_async(args=(str(source_id),), kwargs={"force": force})
+
+
+@celery_app.task(name=DUE_SOURCES_TASK)
+def sync_due_sources_task() -> int:
+    async def find(
+        sessionmaker: async_sessionmaker[AsyncSession], settings: Settings
+    ) -> list[uuid.UUID]:
+        async with sessionmaker() as session:
+            return await due_sources(session, settings, datetime.now(UTC))
+
+    due = _run(find)
+    for source_id in due:
+        enqueue_source_sync(source_id)
+    return len(due)

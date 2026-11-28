@@ -2,9 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from opspilot.models import DocumentStatus, Role, SourceType
+from opspilot.models import Document, DocumentStatus, Role, SourceType
 
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
@@ -68,9 +68,24 @@ class DocumentOut(BaseModel):
     status: DocumentStatus
     error: str | None
     chunk_count: int
+    # Synced documents: the source and the file's path in it
+    source_id: uuid.UUID | None
+    external_path: str | None
+    # Whether the original file is kept (GET /v1/documents/{id}/original)
+    has_original: bool
     created_at: datetime
     updated_at: datetime
     processed_at: datetime | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _original(cls, value: object) -> object:
+        if isinstance(value, Document):
+            return {
+                **{k: getattr(value, k) for k in cls.model_fields if k != "has_original"},
+                "has_original": value.storage_key is not None,
+            }
+        return value
 
 
 class DocumentPage(BaseModel):

@@ -15,11 +15,11 @@ The plan OpsPilot is built against: one branch at a time, each with tests, a pul
 
 | # | Planned branch | Status | Delivered in | Still missing |
 |---|---|---|---|---|
-| 3 | `feat/ingestion-pipeline` | 🟡 | #3 `feat/document-ingestion`: upload, Celery jobs with retries, status API, content-hash dedupe | GitHub source connector, raw files in S3 (MinIO locally), dead-letter queue |
-| 4 | `feat/chunking-embeddings` | 🟡 | #3, #4: heading-aware chunking, batched embeddings, HNSW index, re-indexing only stale documents | Code chunked by function |
-| 5 | `feat/hybrid-retrieval` | 🔨 | #4 `feat/hybrid-search`: full-text + vector search, RRF, metadata filters, query-embedding cache; `feat/answer-quality`: local cross-encoder re-ranker | |
-| 6 | `feat/retrieval-evals` | 🔨 | #4, #5: question set, hit@k and MRR, comparison table in the README; `feat/answer-quality`: quality gate in CI | |
-| 7 | `feat/grounded-answers` | 🔨 | #5: answers citing passages, citations verified, reviewer pass, token counts; `feat/answer-quality`: SSE streaming, layered prompt-injection defences, cost tracking and budgets, answer evaluation with an LLM faithfulness judge | |
+| 3 | `feat/ingestion-pipeline` | 🔨 | #3 `feat/document-ingestion`: upload, Celery jobs with retries, status API, content-hash dedupe; `feat/sources-storage`: incremental GitHub sync (signed push webhooks + catch-up), originals in S3 (RustFS locally: MinIO stopped publishing images), dead-letter queue | |
+| 4 | `feat/chunking-embeddings` | 🔨 | #3, #4: heading-aware chunking, batched embeddings, HNSW index, re-indexing only stale documents; `feat/sources-storage`: code chunked by function (Python `ast`, brace languages, Ruby) | |
+| 5 | `feat/hybrid-retrieval` | ✅ | #4 `feat/hybrid-search`: full-text + vector search, RRF, metadata filters, query-embedding cache; #10 `feat/answer-quality`: local cross-encoder re-ranker | |
+| 6 | `feat/retrieval-evals` | ✅ | #4, #5: question set, hit@k and MRR, comparison table in the README; #10 `feat/answer-quality`: quality gate in CI | |
+| 7 | `feat/grounded-answers` | ✅ | #5: answers citing passages, citations verified, reviewer pass, token counts; `#10 `feat/answer-quality`: SSE streaming, layered prompt-injection defences, cost tracking and budgets, answer evaluation with an LLM faithfulness judge | |
 
 ## Phase 3: The incident agent (resume checkpoint 2)
 
@@ -45,8 +45,8 @@ The plan OpsPilot is built against: one branch at a time, each with tests, a pul
 
 1. ✅ **#8 `feat/telemetry-tools`.** The agent needs real metrics, logs and deploys to investigate, and Kuturl plus the incident simulator give staged incidents with known causes to measure it against.
 2. ✅ **#9 `feat/agent-v2`.** The rest of the planned agent: the plan → evidence → hypotheses → verify flow, token budget, resumable runs, human approval before actions, and draft postmortems (#10's gap).
-3. 🔨 **`feat/answer-quality`.** The rest of #5–#7: re-ranker, CI evaluation gate, SSE streaming, prompt-injection defences, cost tracking, faithfulness evaluation.
-4. **`feat/sources-storage`.** The rest of #3–#4: GitHub connector, S3/MinIO storage, dead-letter queue, code chunking.
+3. ✅ **`feat/answer-quality`.** The rest of #5–#7: re-ranker, CI evaluation gate, SSE streaming, prompt-injection defences, cost tracking, faithfulness evaluation.
+4. 🔨 **`feat/sources-storage`.** The rest of #3–#4: GitHub connector, S3/MinIO storage, dead-letter queue, code chunking.
 5. Then #12 → #17 as planned.
 
 ## Ground rules

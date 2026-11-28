@@ -129,6 +129,14 @@ def queued_investigations(app: FastAPI) -> list[uuid.UUID]:
 
 
 @pytest.fixture
+def queued_syncs(app: FastAPI) -> list[tuple[uuid.UUID, bool]]:
+    """Source syncs handed to the worker, with their force flag. No real broker."""
+    queued: list[tuple[uuid.UUID, bool]] = []
+    app.state.enqueue_source_sync = lambda source_id, force=False: queued.append((source_id, force))
+    return queued
+
+
+@pytest.fixture
 def ingest(app: FastAPI, settings: Settings) -> Callable[..., Awaitable[Outcome]]:
     """Runs ingestion the way the worker would, in the test's event loop."""
 

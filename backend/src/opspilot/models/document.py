@@ -35,6 +35,8 @@ class SourceType(enum.StrEnum):
     RUNBOOK = "runbook"
     POSTMORTEM = "postmortem"
     ARCHITECTURE = "architecture"
+    # Source files synced from a repository, chunked by function (ingestion/code.py)
+    CODE = "code"
     OTHER = "other"
 
 
@@ -49,8 +51,17 @@ class Document(IdMixin, CreatedAtMixin, Base):
     __table_args__ = (
         CheckConstraint(_one_of("status", DocumentStatus), name="status_valid"),
         CheckConstraint(_one_of("source_type", SourceType), name="source_type_valid"),
-        # The same file uploaded twice to one workspace is a duplicate, not a second document
-        UniqueConstraint("workspace_id", "content_hash"),
+        # The same file uploaded twice to one workspace is a duplicate, not a second document.
+        # Synced files are exempt: two files in a repository can have the same content
+        Index(
+            "uq_documents_upload_content_hash",
+            "workspace_id",
+            "content_hash",
+            unique=True,
+            postgresql_where=text("source_id IS NULL"),
+        ),
+        # One document per file of a source
+        UniqueConstraint("source_id", "external_path"),
         # Lets chunks reference (id, workspace_id), so a chunk can't end up in another workspace
         UniqueConstraint("id", "workspace_id"),
         # Serves the newest-first, cursor-paginated document list
@@ -75,6 +86,15 @@ class Document(IdMixin, CreatedAtMixin, Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     error: Mapped[str | None] = mapped_column(Text)
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Synced documents: the source, the file's path in it, and its version there (a git blob
+    # sha), so a sync only re-indexes files that changed
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE")
+    )
+    external_path: Mapped[str | None] = mapped_column(String(1024))
+    external_sha: Mapped[str | None] = mapped_column(String(64))
+    # Where the original file is kept in object storage (None: not kept)
+    storage_key: Mapped[str | None] = mapped_column(String(512))
     uploaded_by_key_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="SET NULL")
     )

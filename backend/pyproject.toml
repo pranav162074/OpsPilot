@@ -20,6 +20,7 @@ dependencies = [
     "langchain-google-genai>=4.5.2",
     "mcp>=2.3,<3",
     "cryptography>=50.0",
+    "boto3>=1.40",
 ]
 
 [project.scripts]
@@ -39,6 +40,8 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "celery-types>=0.26.0",
+    "moto[s3]>=5.1",
+    "boto3-stubs[s3]>=1.40",
 ]
 
 [build-system]

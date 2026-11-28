@@ -18,9 +18,11 @@ from sqlalchemy import and_, delete, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from opspilot import dead_letters
 from opspilot.config import Settings
 from opspilot.embeddings import Embedder, EmbeddingError, EmbeddingUnavailable
 from opspilot.ingestion.chunking import ChunkDraft, chunk_text
+from opspilot.ingestion.code import chunk_code, language_of_media_type
 from opspilot.models import Chunk, Document, DocumentStatus
 from opspilot.security.injection import scan
 
@@ -57,12 +59,33 @@ def _claimable(settings: Settings, now: datetime) -> object:
     )
 
 
-async def _fail(session: AsyncSession, document_id: uuid.UUID, attempt: int, error: str) -> None:
-    await session.execute(
+async def _fail(
+    session: AsyncSession,
+    document_id: uuid.UUID,
+    attempt: int,
+    error: str,
+    *,
+    dead_letter: bool = False,
+) -> None:
+    """Marks the document failed. With dead_letter, the failure is one a person can fix and
+    retry (an embedding service that kept failing), so it goes to the dead-letter queue too;
+    an empty file doesn't."""
+    failed = await session.scalar(
         update(Document)
         .where(Document.id == document_id, Document.attempts == attempt)
         .values(status=DocumentStatus.FAILED.value, error=error, updated_at=datetime.now(UTC))
+        .returning(Document.workspace_id)
     )
+    if dead_letter and failed is not None:
+        await dead_letters.record(
+            session,
+            task=dead_letters.INGESTION,
+            job_key=f"document:{document_id}",
+            payload={"document_id": str(document_id)},
+            error=error,
+            attempts=attempt,
+            workspace_id=failed,
+        )
     await session.commit()
 
 
@@ -110,7 +133,13 @@ async def ingest_document(
         attempt = claimed.attempts
 
         if attempt > settings.ingestion_max_attempts:
-            await _fail(session, document_id, attempt, f"Gave up after {attempt - 1} attempts")
+            await _fail(
+                session,
+                document_id,
+                attempt,
+                f"Gave up after {attempt - 1} attempts",
+                dead_letter=True,
+            )
             return Outcome.FAILED
 
     try:
@@ -153,11 +182,17 @@ async def _process(
     if content is None:
         return Outcome.SKIPPED
 
-    drafts = chunk_text(
-        content,
-        markdown=media_type == MARKDOWN,
-        max_tokens=settings.chunk_max_tokens,
-        overlap_tokens=settings.chunk_overlap_tokens,
+    language = language_of_media_type(media_type)
+    drafts = (
+        # Code is split by function and class, not by paragraph
+        chunk_code(content, language, settings.chunk_max_tokens)
+        if language
+        else chunk_text(
+            content,
+            markdown=media_type == MARKDOWN,
+            max_tokens=settings.chunk_max_tokens,
+            overlap_tokens=settings.chunk_overlap_tokens,
+        )
     )
     if not drafts:
         async with sessionmaker() as session:
@@ -169,7 +204,7 @@ async def _process(
         vectors = await embedder.embed_documents([embedding_text(d) for d in drafts])
     except EmbeddingError as exc:
         async with sessionmaker() as session:
-            await _fail(session, document_id, attempt, f"Embedding failed: {exc}")
+            await _fail(session, document_id, attempt, f"Embedding failed: {exc}", dead_letter=True)
         return Outcome.FAILED
 
     async with sessionmaker() as session:
