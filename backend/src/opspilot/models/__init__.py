@@ -1,5 +1,6 @@
 from opspilot.models.api_key import ApiKey, Role
 from opspilot.models.base import Base
+from opspilot.models.dead_letter import DeadLetter, DeadLetterStatus
 from opspilot.models.document import Chunk, Document, DocumentStatus, SourceType
 from opspilot.models.incident import Incident, IncidentEvent, IncidentStatus, Severity
 from opspilot.models.investigation import (
@@ -8,6 +9,7 @@ from opspilot.models.investigation import (
     InvestigationAction,
     InvestigationStatus,
 )
+from opspilot.models.source import Source, SourceKind, SourceStatus
 from opspilot.models.telemetry import Deploy, Integration, IntegrationKind
 from opspilot.models.workspace import Workspace
 
@@ -16,6 +18,8 @@ __all__ = [
     "ApiKey",
     "Base",
     "Chunk",
+    "DeadLetter",
+    "DeadLetterStatus",
     "Deploy",
     "Document",
     "DocumentStatus",
@@ -29,6 +33,9 @@ __all__ = [
     "InvestigationStatus",
     "Role",
     "Severity",
+    "Source",
+    "SourceKind",
+    "SourceStatus",
     "SourceType",
     "Workspace",
 ]

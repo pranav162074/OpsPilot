@@ -50,6 +50,21 @@ class Settings(BaseSettings):
 
     # Search: how many candidates each retriever contributes before fusion, and the RRF
     # constant (60 is the value from the original paper; higher flattens rank differences)
+    # Original files: "none", "local" (a directory) or "s3" (S3, MinIO, R2...); see storage/
+    storage_backend: Literal["none", "local", "s3"] = "none"
+    storage_local_dir: str = "./data/objects"
+    s3_bucket: str = "opspilot"
+    # Leave blank for AWS itself; http://localhost:9000 for MinIO
+    s3_endpoint_url: str | None = None
+    s3_region: str = "us-east-1"
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: SecretStr | None = None
+    # Sources: where the GitHub API is (tests point it at a fake), how often sources are
+    # synced without a webhook, and what a sync takes in
+    github_api_url: str = "https://api.github.com"
+    source_sync_interval_minutes: int = 30
+    source_max_files: int = 2000
+    source_max_file_bytes: int = 512 * 1024
     search_candidates: int = 50
     rrf_k: int = 60
     # A cross-encoder re-orders the top candidates (see search/rerank.py). Needs
@@ -121,6 +136,9 @@ class Settings(BaseSettings):
         "integrations_key",
         "integrations_allow_private_urls",
         "reranker_cache_dir",
+        "s3_endpoint_url",
+        "s3_access_key_id",
+        "s3_secret_access_key",
         mode="before",
     )
     @classmethod

@@ -88,6 +88,61 @@ Other details:
 - The list is newest first with cursor pagination (`?limit=20&cursor=...`), and filters by `status` and `source_type`.
 - Worker logs carry the request ID of the upload that queued the task.
 
+### Code, chunked by function
+
+Source code (`.py`, `.ts`/`.tsx`, `.js`, `.go`, `.java`, `.kt`, `.cs`, `.rs`, `.php`, `.rb`, `.sh`) can be uploaded or synced. It's split where a programmer would split it, one chunk per function, method or class, each headed with its name (`GatewayClient.charge`), which is also what keyword search matches ([`ingestion/code.py`](backend/src/opspilot/ingestion/code.py)):
+
+- **Python** is parsed with `ast`: exact boundaries, decorators and the comments above a definition included. A class too big for one chunk becomes its header (docstring, attributes) plus a chunk per method.
+- **Brace languages** are split at declarations found by per-language patterns, each extended to its matching closing brace, skipping braces inside strings and comments. Go methods are named `Receiver.Method`.
+- **Ruby** blocks end at the `end` matching their indentation.
+- Imports and module-level code stay searchable as `(module)` chunks; code that doesn't parse falls back to windows of whole lines. Every chunk is still an exact slice of the file.
+
+### Sources: syncing a GitHub repository
+
+Instead of uploading runbooks one by one, connect the repository they live in (admin):
+
+```bash
+curl -X POST localhost:8000/v1/sources -H "Authorization: Bearer ops_..." -H "Content-Type: application/json" \
+  -d '{"repository": "acme/platform", "paths": ["docs/runbooks", "src/payments"], "include_code": true, "token": "github_pat_..."}'
+```
+
+GitHub is asked about the repository first, so a typo or a missing token fails now (`422`), not in a background job. Leave out `ref` to follow the default branch. The token is optional for public repositories; it's stored encrypted (`INTEGRATIONS_KEY`), like telemetry tokens.
+
+**Syncs are incremental** ([`sources/sync.py`](backend/src/opspilot/sources/sync.py)). One request reads the branch's latest commit, and the sync stops there if the documents already match it. Otherwise one request lists the whole tree, and each file's blob sha is compared with the one stored on its document: only new and changed files are downloaded (8 at a time) and re-indexed, and documents of deleted files are removed. A thousand-file repository where one file changed costs four requests and one re-index.
+
+**Which files:** documentation (`.md`, `.markdown`, `.txt`, `.rst`) under the configured paths, plus code with `include_code`. Dependency and build directories (`node_modules`, `vendor`, `dist`, ...) and dot-directories are skipped, as are files over `SOURCE_MAX_FILE_BYTES`, binary files and anything that isn't UTF-8. Invisible Unicode is stripped, as for uploads. Two files with the same content are two documents (the duplicate check applies to uploads only).
+
+**When:** GitHub calls the source's webhook on every push. The URL and secret come back once, when the source is created (repository → Settings → Webhooks, content type `application/json`, the push event). The webhook is verified by its `X-Hub-Signature-256` HMAC, so it needs no API key, and pushes to other branches are ignored. A beat job also syncs any source not synced for `SOURCE_SYNC_INTERVAL_MINUTES`, the catch-up for webhooks that never arrived. `POST /v1/sources/{id}/sync` (responder) syncs now, and `?force=true` compares every file even at an unchanged commit.
+
+**When GitHub fails:** a 5xx, a timeout or a used-up rate limit is retried with backoff (30 s doubling, or as long as GitHub's `retry-after` says). A revoked token or a deleted repository won't fix itself: the source is marked `failed` with the reason, and the job goes straight to the dead-letter queue. A sync that died mid-way is taken over after 15 minutes. `GET /v1/sources/{id}` shows the status, last commit, last error, document counts and what the last sync did (`added`, `updated`, `deleted`, `unchanged`, `skipped`).
+
+### Original files in object storage
+
+The text OpsPilot indexes lives in Postgres. With `STORAGE_BACKEND=s3` or `local`, the files it came from are kept too, byte for byte, so they can be downloaded (`GET /v1/documents/{id}/original`) and processed again by a better parser or a new chunker, without asking anyone to upload them again ([`storage/`](backend/src/opspilot/storage/__init__.py)).
+
+- Keys are `workspaces/<workspace>/documents/<document>/<sha256>`: a changed file never overwrites the previous version's object.
+- The original is written **before** the database row, so a failed insert leaves a harmless orphan, never a document pointing at nothing. Uploads ask S3 to verify a SHA-256 checksum.
+- S3 means anything that speaks its API: AWS, Cloudflare R2, or locally RustFS (`docker compose --profile storage up -d objects`). MinIO, the usual choice, stopped publishing community images in October 2025. Tests use `moto`, so nothing reaches a network.
+- Downloads are always served as attachments, with `nosniff` and a sandboxing CSP, so an uploaded HTML file can't run in OpsPilot's origin.
+
+### The dead-letter queue
+
+Retries handle what time fixes (a rate limit, a restart). What's left after them, or fails in a way retrying can't fix, lands in the **dead-letter queue** with the job's arguments and error ([`dead_letters.py`](backend/src/opspilot/dead_letters.py)), instead of in a log line nobody reads:
+
+- ingestion that ran out of attempts, or that the embedding service kept rejecting;
+- source syncs that failed for good, or ran out of retries (a Celery base task records any final failure);
+- original files whose deletion failed after their document was deleted.
+
+There's one open dead letter per job: the same job failing again updates it and counts the failure, so a broken source synced every 30 minutes is one row, not fifty.
+
+| Endpoint (admin) | |
+|---|---|
+| `GET /v1/dead-letters?status=dead` | what's waiting (also `retried`, `discarded`) |
+| `POST /v1/dead-letters/{id}/retry` | sends it again: a document gets a fresh set of attempts, a sync is queued, a leftover file is deleted on the spot |
+| `POST /v1/dead-letters/{id}/discard` | not worth retrying |
+
+Both are conditional updates, so two admins clicking at once send a job once. A retry that fails again comes back to the queue.
+
 ## Search
 
 `POST /v1/search` (viewer) finds the passages in a workspace's documents that best answer a question:
